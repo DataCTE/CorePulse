@@ -1,0 +1,372 @@
+"""
+Masked prompt injection system for CorePulse.
+
+This module provides token-level masking capabilities for selective prompt conditioning,
+allowing fine-grained control over which parts of a prompt get modified during injection.
+"""
+
+import torch
+import re
+from typing import Dict, List, Union, Optional, Tuple, Any
+from diffusers import DiffusionPipeline
+from transformers import PreTrainedTokenizer
+
+from .base import BasePromptInjector, PromptInjectionConfig
+from .advanced import AdvancedPromptInjector
+from ..models.base import BlockIdentifier
+
+
+class TokenMask:
+    """
+    Represents a token-level mask for selective conditioning.
+    """
+    
+    def __init__(self, token_ids: torch.Tensor, mask: torch.Tensor, target_phrase: str):
+        """
+        Initialize token mask.
+        
+        Args:
+            token_ids: Token IDs of the full prompt
+            mask: Binary mask indicating which tokens to replace (1) or preserve (0)
+            target_phrase: The phrase being targeted for replacement
+        """
+        self.token_ids = token_ids
+        self.mask = mask  # Shape: [sequence_length]
+        self.target_phrase = target_phrase
+        
+    @property
+    def num_masked_tokens(self) -> int:
+        """Number of tokens that will be replaced."""
+        return int(self.mask.sum())
+    
+    def get_masked_positions(self) -> List[int]:
+        """Get list of positions where mask is active."""
+        return torch.nonzero(self.mask, as_tuple=True)[0].tolist()
+
+
+class TokenAnalyzer:
+    """
+    Analyzes prompts to identify token positions for masking.
+    """
+    
+    def __init__(self, tokenizer: PreTrainedTokenizer):
+        """
+        Initialize token analyzer.
+        
+        Args:
+            tokenizer: The tokenizer to use for analysis
+        """
+        self.tokenizer = tokenizer
+        
+    def create_phrase_mask(self, prompt: str, target_phrase: str, 
+                          fuzzy_match: bool = True) -> TokenMask:
+        """
+        Create a token mask for a target phrase within a prompt.
+        
+        Args:
+            prompt: Full prompt text
+            target_phrase: Phrase to mask (e.g., "cat")
+            fuzzy_match: Whether to allow fuzzy matching for phrases
+            
+        Returns:
+            TokenMask object
+        """
+        # Tokenize the full prompt
+        tokens = self.tokenizer(
+            prompt,
+            return_tensors="pt",
+            padding="max_length",
+            max_length=self.tokenizer.model_max_length,
+            truncation=True,
+        )
+        
+        token_ids = tokens.input_ids[0]
+        
+        # Convert tokens back to text to find positions
+        decoded_tokens = [
+            self.tokenizer.decode([token_id], skip_special_tokens=True) 
+            for token_id in token_ids
+        ]
+        
+        # Find target phrase in the decoded tokens
+        mask = torch.zeros_like(token_ids, dtype=torch.bool)
+        
+        if fuzzy_match:
+            mask = self._create_fuzzy_mask(decoded_tokens, target_phrase, mask)
+        else:
+            mask = self._create_exact_mask(decoded_tokens, target_phrase, mask)
+        
+        return TokenMask(token_ids, mask, target_phrase)
+    
+    def _create_fuzzy_mask(self, decoded_tokens: List[str], target_phrase: str, 
+                          mask: torch.Tensor) -> torch.Tensor:
+        """
+        Create mask using fuzzy matching for multi-token phrases.
+        """
+        # Convert target phrase to lowercase for matching
+        target_lower = target_phrase.lower().strip()
+        
+        # Build a sliding window to find the phrase
+        for i in range(len(decoded_tokens)):
+            # Build potential phrase from current position
+            current_phrase = ""
+            for j in range(i, min(i + 10, len(decoded_tokens))):  # Max 10 tokens
+                token_text = decoded_tokens[j].strip()
+                if token_text:  # Skip empty tokens
+                    current_phrase += token_text
+                    
+                    # Check if we have a match
+                    if target_lower in current_phrase.lower():
+                        # Mark all tokens that contributed to this phrase
+                        for k in range(i, j + 1):
+                            if decoded_tokens[k].strip():  # Only mark non-empty tokens
+                                mask[k] = True
+                        return mask
+                        
+        return mask
+    
+    def _create_exact_mask(self, decoded_tokens: List[str], target_phrase: str,
+                          mask: torch.Tensor) -> torch.Tensor:
+        """
+        Create mask using exact token matching.
+        """
+        target_tokens = self.tokenizer.encode(target_phrase, add_special_tokens=False)
+        
+        # Find exact sequence matches
+        for i in range(len(decoded_tokens) - len(target_tokens) + 1):
+            # Check if we have a match starting at position i
+            match = True
+            for j, target_token in enumerate(target_tokens):
+                if decoded_tokens[i + j] != self.tokenizer.decode([target_token]):
+                    match = False
+                    break
+            
+            if match:
+                # Mark the matching tokens
+                for j in range(len(target_tokens)):
+                    mask[i + j] = True
+                break
+                
+        return mask
+
+
+class MaskedPromptEncoder:
+    """
+    Encodes prompts with selective token-level replacement.
+    """
+    
+    def __init__(self, injector: BasePromptInjector):
+        """
+        Initialize masked prompt encoder.
+        
+        Args:
+            injector: Base prompt injector for encoding capabilities
+        """
+        self.injector = injector
+        
+    def encode_masked_prompt(self, base_prompt: str, injection_prompt: str,
+                           token_mask: TokenMask, pipeline: DiffusionPipeline) -> torch.Tensor:
+        """
+        Encode a prompt with selective token replacement.
+        
+        Args:
+            base_prompt: Original prompt
+            injection_prompt: Prompt containing replacement content
+            token_mask: Mask indicating which tokens to replace
+            pipeline: Pipeline for encoding
+            
+        Returns:
+            Blended prompt embedding
+        """
+        print(f" MASKED ENCODING:")
+        print(f"   Base: '{base_prompt}'")
+        print(f"   Injection: '{injection_prompt}'")
+        print(f"   Target phrase: '{token_mask.target_phrase}'")
+        print(f"   Masked tokens: {token_mask.num_masked_tokens}")
+        
+        # Encode both prompts
+        base_embedding = self.injector.encode_prompt(base_prompt, pipeline)
+        injection_embedding = self.injector.encode_prompt(injection_prompt, pipeline)
+        
+        # Create blended embedding
+        blended_embedding = self._blend_embeddings(
+            base_embedding, injection_embedding, token_mask
+        )
+        
+        print(f"   Blended shape: {blended_embedding.shape}")
+        
+        return blended_embedding
+    
+    def _blend_embeddings(self, base_embedding: torch.Tensor, 
+                         injection_embedding: torch.Tensor, 
+                         token_mask: TokenMask) -> torch.Tensor:
+        """
+        Blend embeddings at the token level using the mask.
+        """
+        # Ensure embeddings have the same shape
+        if base_embedding.shape != injection_embedding.shape:
+            raise ValueError(f"Embedding shapes don't match: {base_embedding.shape} vs {injection_embedding.shape}")
+        
+        # Create result tensor
+        blended = base_embedding.clone()
+        
+        # Move mask to same device as embeddings
+        mask_device = token_mask.mask.to(device=base_embedding.device, dtype=torch.bool)
+        
+        # Apply mask - replace masked positions with injection embedding
+        mask_expanded = mask_device.unsqueeze(-1).expand_as(base_embedding[0])
+        
+        print(f"   Mask shape: {mask_device.shape}, Expanded: {mask_expanded.shape}")
+        print(f"   Mask device: {mask_device.device}, Embedding device: {base_embedding.device}")
+        
+        # Blend: keep base where mask is 0, use injection where mask is 1
+        blended[0] = torch.where(mask_expanded, injection_embedding[0], base_embedding[0])
+        
+        # For batch size > 1, apply the same blending
+        for i in range(1, base_embedding.shape[0]):
+            blended[i] = torch.where(mask_expanded, injection_embedding[i], base_embedding[i])
+            
+        return blended
+
+
+class MaskedPromptInjector(AdvancedPromptInjector):
+    """
+    Advanced prompt injector with token-level masking capabilities.
+    """
+    
+    def __init__(self, model_type: str = "sdxl"):
+        """
+        Initialize masked prompt injector.
+        
+        Args:
+            model_type: Model type ("sdxl" or "sd15")
+        """
+        super().__init__(model_type)
+        self.masked_configs: Dict[str, Dict[str, Any]] = {}
+        self._token_analyzer: Optional[TokenAnalyzer] = None
+        self._masked_encoder: Optional[MaskedPromptEncoder] = None
+        
+    def add_masked_injection(self, 
+                           block: Union[str, BlockIdentifier],
+                           base_prompt: str,
+                           injection_prompt: str, 
+                           target_phrase: str,
+                           weight: float = 1.0,
+                           sigma_start: float = 0.0,
+                           sigma_end: float = 1.0,
+                           fuzzy_match: bool = True):
+        """
+        Add a masked injection that targets specific phrases.
+        
+        Args:
+            block: Block identifier or "all"
+            base_prompt: Original prompt 
+            injection_prompt: Prompt with replacement content
+            target_phrase: Specific phrase to replace (e.g., "cat")
+            weight: Injection weight
+            sigma_start: Start of injection window
+            sigma_end: End of injection window
+            fuzzy_match: Whether to use fuzzy phrase matching
+        """
+        # Store masked configuration for later processing
+        config_id = f"masked_{len(self.masked_configs)}"
+        
+        self.masked_configs[config_id] = {
+            'block': block,
+            'base_prompt': base_prompt,
+            'injection_prompt': injection_prompt,
+            'target_phrase': target_phrase,
+            'weight': weight,
+            'sigma_start': sigma_start,
+            'sigma_end': sigma_end,
+            'fuzzy_match': fuzzy_match
+        }
+        
+    def apply_to_pipeline(self, pipeline: DiffusionPipeline) -> DiffusionPipeline:
+        """
+        Apply masked injections to pipeline.
+        
+        Args:
+            pipeline: Pipeline to modify
+            
+        Returns:
+            Modified pipeline
+        """
+        if not self.masked_configs:
+            # Fall back to regular injection if no masked configs
+            return super().apply_to_pipeline(pipeline)
+        
+        # Initialize analyzers
+        if hasattr(pipeline, 'tokenizer'):
+            self._token_analyzer = TokenAnalyzer(pipeline.tokenizer)
+            self._masked_encoder = MaskedPromptEncoder(self)
+        else:
+            raise ValueError("Pipeline must have tokenizer for masked injection")
+        
+        # Process each masked configuration
+        for config_id, config in self.masked_configs.items():
+            # Create token mask
+            token_mask = self._token_analyzer.create_phrase_mask(
+                config['base_prompt'], 
+                config['target_phrase'],
+                config['fuzzy_match']
+            )
+            
+            # Encode masked prompt
+            masked_embedding = self._masked_encoder.encode_masked_prompt(
+                config['base_prompt'],
+                config['injection_prompt'], 
+                token_mask,
+                pipeline
+            )
+            
+            # Add as regular injection
+            self.add_injection(
+                block=config['block'],
+                prompt="",  # Dummy prompt since we have pre-encoded embedding
+                weight=config['weight'],
+                sigma_start=config['sigma_start'],
+                sigma_end=config['sigma_end']
+            )
+            
+            # Replace the encoded prompt directly in the configs
+            # Handle "all" blocks first
+            if isinstance(config['block'], str) and config['block'].lower() == "all":
+                all_blocks = self.patcher.block_mapper.get_all_block_identifiers()
+                for block_id_str in all_blocks:
+                    block_id = BlockIdentifier.from_string(block_id_str)
+                    if block_id in self.configs:
+                        self.configs[block_id]._encoded_prompt = masked_embedding
+            else:
+                # Handle single block
+                block_id = BlockIdentifier.from_string(config['block']) if isinstance(config['block'], str) else config['block']
+                if block_id in self.configs:
+                    self.configs[block_id]._encoded_prompt = masked_embedding
+        
+        return super().apply_to_pipeline(pipeline)
+    
+    def clear_injections(self):
+        """Clear all injections including masked ones."""
+        super().clear_injections()
+        self.masked_configs.clear()
+        
+    def get_masking_summary(self) -> List[Dict[str, Any]]:
+        """
+        Get summary of all masked injection configurations.
+        
+        Returns:
+            List of masking summaries
+        """
+        summaries = []
+        for config_id, config in self.masked_configs.items():
+            summaries.append({
+                "config_id": config_id,
+                "block": config['block'],
+                "base_prompt": config['base_prompt'],
+                "injection_prompt": config['injection_prompt'],
+                "target_phrase": config['target_phrase'],
+                "weight": config['weight'],
+                "sigma_range": f"{config['sigma_start']:.1f} - {config['sigma_end']:.1f}",
+                "fuzzy_match": config['fuzzy_match']
+            })
+        return summaries

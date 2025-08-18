@@ -10,9 +10,11 @@ __author__ = "CorePulse Contributors"
 
 from .prompt_injection import SimplePromptInjector, AdvancedPromptInjector
 from .models import UNetPatcher
+from .prompt_injection.masking import MaskedPromptInjector
 
 __all__ = [
     "SimplePromptInjector",
     "AdvancedPromptInjector", 
     "UNetPatcher",
+    "MaskedPromptInjector",
 ]
