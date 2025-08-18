@@ -178,11 +178,6 @@ class MaskedPromptEncoder:
         Returns:
             Blended prompt embedding
         """
-        print(f" MASKED ENCODING:")
-        print(f"   Base: '{base_prompt}'")
-        print(f"   Injection: '{injection_prompt}'")
-        print(f"   Target phrase: '{token_mask.target_phrase}'")
-        print(f"   Masked tokens: {token_mask.num_masked_tokens}")
         
         # Encode both prompts
         base_embedding = self.injector.encode_prompt(base_prompt, pipeline)
@@ -193,7 +188,6 @@ class MaskedPromptEncoder:
             base_embedding, injection_embedding, token_mask
         )
         
-        print(f"   Blended shape: {blended_embedding.shape}")
         
         return blended_embedding
     
@@ -216,8 +210,6 @@ class MaskedPromptEncoder:
         # Apply mask - replace masked positions with injection embedding
         mask_expanded = mask_device.unsqueeze(-1).expand_as(base_embedding[0])
         
-        print(f"   Mask shape: {mask_device.shape}, Expanded: {mask_expanded.shape}")
-        print(f"   Mask device: {mask_device.device}, Embedding device: {base_embedding.device}")
         
         # Blend: keep base where mask is 0, use injection where mask is 1
         blended[0] = torch.where(mask_expanded, injection_embedding[0], base_embedding[0])
@@ -263,7 +255,7 @@ class MaskedPromptInjector(AdvancedPromptInjector):
             base_prompt: Original prompt 
             injection_prompt: Prompt with replacement content
             target_phrase: Specific phrase to replace (e.g., "cat")
-            weight: Injection weight
+            weight: Injection weight (1.0 = normal, >1.0 = amplified, <1.0 = weakened)
             sigma_start: Start of injection window
             sigma_end: End of injection window
             fuzzy_match: Whether to use fuzzy phrase matching

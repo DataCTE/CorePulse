@@ -42,7 +42,6 @@ class BasePromptInjector(ABC):
         Returns:
             Encoded prompt tensor
         """
-        print(f" ENCODING PROMPT: '{prompt}'")
         
         if hasattr(pipeline, 'text_encoder') and hasattr(pipeline, 'tokenizer'):
             # Standard diffusers pipeline
@@ -54,13 +53,10 @@ class BasePromptInjector(ABC):
                 return_tensors="pt",
             )
             
-            print(f"   Tokenized: {text_inputs.input_ids[0][:10]}...")  # First 10 tokens
             
             with torch.no_grad():
                 text_embeddings = pipeline.text_encoder(text_inputs.input_ids.to(pipeline.device))[0]
             
-            print(f"   Encoded shape: {text_embeddings.shape}")
-            print(f"   First few values: {text_embeddings[0, 0, :5]}")
             
             return text_embeddings
         
@@ -171,22 +167,25 @@ class PromptInjectionConfig:
                  prompt: str,
                  weight: float = 1.0,
                  sigma_start: float = 0.0,
-                 sigma_end: float = 1.0):
+                 sigma_end: float = 1.0,
+                 spatial_mask: Optional[torch.Tensor] = None):
         """
         Initialize injection configuration.
         
         Args:
             block: Block identifier
             prompt: Prompt to inject
-            weight: Injection weight
+            weight: Injection weight (1.0 = normal, >1.0 = amplified, <1.0 = weakened)
             sigma_start: Start sigma for injection window
             sigma_end: End sigma for injection window
+            spatial_mask: Optional spatial mask for regional control
         """
         self.block = BlockIdentifier.from_string(block) if isinstance(block, str) else block
         self.prompt = prompt
         self.weight = weight
         self.sigma_start = sigma_start
         self.sigma_end = sigma_end
+        self.spatial_mask = spatial_mask
         self._encoded_prompt: Optional[torch.Tensor] = None
     
     def get_encoded_prompt(self, pipeline: DiffusionPipeline) -> torch.Tensor:

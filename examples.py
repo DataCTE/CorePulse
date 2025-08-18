@@ -14,6 +14,7 @@ from diffusers import StableDiffusionPipeline
 
 # Import CorePulse components
 from core_pulse import SimplePromptInjector, AdvancedPromptInjector, MaskedPromptInjector
+from core_pulse import RegionalPromptInjector, create_top_left_quadrant_region, create_left_half_region, create_right_half_region, create_center_region
 from core_pulse.utils import detect_model_type
 
 
@@ -277,11 +278,145 @@ def masked_injection_comparison():
     plt.show()
 
 
+def regional_injection_demonstration():
+    """
+    Demonstrate the new REGIONAL injection capability by showing:
+    1. Original: "a cat playing at a park"
+    2. Top-left quadrant: Top-left = "dog", Rest = "cat"
+    
+    This shows how regional injection allows different content in different areas.
+    """
+    print("=== CorePulse: Regional Injection Demonstration ===")
+    
+    # Load SD 1.5 pipeline
+    print("Loading Stable Diffusion 1.5...")
+    pipeline = StableDiffusionPipeline.from_pretrained(
+        "runwayml/stable-diffusion-v1-5",
+        torch_dtype=torch.float16,
+        use_safetensors=True
+    )
+    
+    # Move to GPU if available
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    pipeline = pipeline.to(device)
+    print(f"Using device: {device}")
+    
+    # Base prompt
+    base_prompt = "a cat playing at a park"
+    
+    # Generation parameters
+    num_inference_steps = 20
+    guidance_scale = 7.5
+    seed = 456
+    
+    print(f"Using fixed seed: {seed} for reproducible comparison")
+    
+    # 1. Generate original image
+    print(f"\n1. Generating original: '{base_prompt}'")
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    generator = torch.Generator(device=device).manual_seed(seed)
+    
+    original_result = pipeline(
+        prompt=base_prompt,
+        num_inference_steps=num_inference_steps,
+        guidance_scale=guidance_scale,
+        generator=generator
+    )
+    original_image = original_result.images[0]
+    
+    # 2. Generate with regional injection (left=dog, right=cat)
+    print(f"\n2. Generating with REGIONAL injection (top-left='dog', rest=original)...")
+    print("   This applies 'dog' conditioning only to the TOP-LEFT QUADRANT of the image")
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    generator = torch.Generator(device=device).manual_seed(seed)
+    
+    regional_injector = RegionalPromptInjector("sd15")
+    
+    # Create top-left quadrant region and apply dog injection
+    top_left_region = create_top_left_quadrant_region((512, 512))
+    regional_injector.add_regional_injection(
+        region=top_left_region,
+        base_prompt=base_prompt,
+        injection_prompt="dog",
+        target_phrase="cat",  # Replace "cat" with "dog" in top-left quadrant
+        weight=1.2,
+        fuzzy_match=True
+    )
+    
+    with regional_injector:
+        regional_pipeline = regional_injector.apply_to_pipeline(pipeline)
+        regional_result = regional_pipeline(
+            prompt=base_prompt,
+            num_inference_steps=num_inference_steps,
+            guidance_scale=guidance_scale,
+            generator=generator
+        )
+        regional_image = regional_result.images[0]
+    
+    # Create comparison
+    print("3. Creating regional injection comparison...")
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 7))
+    
+    # Original
+    ax1.imshow(original_image)
+    ax1.set_title("Original\n'a cat playing at a park'", fontsize=12, fontweight='bold')
+    ax1.axis('off')
+    
+    # Regional injection - add visual separator for quadrant
+    ax2.imshow(regional_image)
+    # Draw lines to show the top-left quadrant
+    ax2.axhline(y=regional_image.height//2, color='red', linestyle='--', linewidth=2, alpha=0.7)
+    ax2.axvline(x=regional_image.width//2, color='red', linestyle='--', linewidth=2, alpha=0.7)
+    ax2.set_title("Regional Injection\nTop-left quadrant: 'cat' → 'dog'\nRest: unchanged", fontsize=12, fontweight='bold')
+    ax2.axis('off')
+    
+    # Add main title
+    fig.suptitle("CorePulse Regional Injection - Spatial Control", fontsize=16, fontweight='bold')
+    
+    # Adjust layout and save
+    plt.tight_layout()
+    plt.savefig("media/regional_injection_comparison.png", dpi=150, bbox_inches='tight')
+    
+    print("Comparison saved as 'media/regional_injection_comparison.png'")
+    
+    # Save individual images
+    original_image.save("media/original_regional_demo.png")
+    regional_image.save("media/regional_top_left_dog.png")
+    print("Individual images saved in media/ directory")
+    
+    # Print analysis
+    print(f"\nREGIONAL INJECTION ANALYSIS:")
+    print(f"   • Both images used identical seed ({seed}) and parameters")
+    print(f"   • Regional injection: TOP-LEFT QUADRANT gets 'dog' conditioning")
+    print(f"   • Original conditioning preserved in remaining three quadrants")
+    print(f"   • Spatial control: Different content in different areas")
+    
+    # Show regional summary
+    print(f"\nREGIONAL CONFIGURATION:")
+    for summary in regional_injector.get_regional_summary():
+        print(f"   • Region: {summary['region_type']} covering top-left quadrant")
+        print(f"   • Target phrase: '{summary['target_phrase']}'")
+        print(f"   • Base: '{summary['base_prompt']}'")
+        print(f"   • Injection: '{summary['injection_prompt']}'")
+    
+    plt.show()
+
+
 if __name__ == "__main__":
-    # Run the masked injection demonstration
+    # Run the regional injection demonstration first
+    print("DEMONSTRATING ADVANCED REGIONAL INJECTION CAPABILITIES")
+    regional_injection_demonstration()
+    
+    # Then run the masked injection demonstration
+    print("\n" + "="*60)
+    print("DEMONSTRATING TOKEN-LEVEL MASKED INJECTION")
     masked_injection_comparison()
     
     # Optionally also run the original comparison
     print("\n" + "="*60)
-    print("Running original comparison for reference...")
+    print("DEMONSTRATING BASIC INJECTION")
     cat_vs_dog_comparison()

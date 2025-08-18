@@ -55,7 +55,8 @@ class AdvancedPromptInjector(BasePromptInjector):
                 prompt=prompt,
                 weight=weight,
                 sigma_start=sigma_start,
-                sigma_end=sigma_end
+                sigma_end=sigma_end,
+                spatial_mask=config_dict.get("spatial_mask")
             )
             
             block_id = BlockIdentifier.from_string(block) if isinstance(block, str) else block
@@ -66,16 +67,18 @@ class AdvancedPromptInjector(BasePromptInjector):
                      prompt: str,
                      weight: float = 1.0,
                      sigma_start: float = 0.0,
-                     sigma_end: float = 1.0):
+                     sigma_end: float = 1.0,
+                     spatial_mask: Optional[torch.Tensor] = None):
         """
         Add a single prompt injection or inject into all blocks.
         
         Args:
             block: Block identifier (string like "input:4", "all", or BlockIdentifier)
             prompt: Prompt to inject
-            weight: Injection weight
+            weight: Injection weight (1.0 = normal, >1.0 = amplified, <1.0 = weakened)
             sigma_start: Start of injection window
             sigma_end: End of injection window
+            spatial_mask: Optional spatial mask for regional control
         """
         # Handle "all" keyword
         if isinstance(block, str) and block.lower() == "all":
@@ -86,7 +89,8 @@ class AdvancedPromptInjector(BasePromptInjector):
                     prompt=prompt,
                     weight=weight,
                     sigma_start=sigma_start,
-                    sigma_end=sigma_end
+                    sigma_end=sigma_end,
+                    spatial_mask=spatial_mask
                 )
                 block_id = BlockIdentifier.from_string(block_id_str)
                 self.configs[block_id] = config
@@ -98,7 +102,8 @@ class AdvancedPromptInjector(BasePromptInjector):
             prompt=prompt,
             weight=weight,
             sigma_start=sigma_start,
-            sigma_end=sigma_end
+            sigma_end=sigma_end,
+            spatial_mask=spatial_mask
         )
         
         block_id = BlockIdentifier.from_string(block) if isinstance(block, str) else block
@@ -148,14 +153,19 @@ class AdvancedPromptInjector(BasePromptInjector):
         
         # Encode all prompts and add to patcher
         for block_id, config in self.configs.items():
-            encoded_prompt = self.encode_prompt(config.prompt, pipeline)
+            # Use pre-encoded prompt if available, otherwise encode the prompt
+            if config._encoded_prompt is not None:
+                encoded_prompt = config._encoded_prompt
+            else:
+                encoded_prompt = self.encode_prompt(config.prompt, pipeline)
             
             self.patcher.add_injection(
                 block=block_id,
                 conditioning=encoded_prompt,
                 weight=config.weight,
                 sigma_start=config.sigma_start,
-                sigma_end=config.sigma_end
+                sigma_end=config.sigma_end,
+                spatial_mask=config.spatial_mask
             )
         
         return super().apply_to_pipeline(pipeline)

@@ -93,17 +93,19 @@ class PromptInjectionProcessor:
     
     This is similar to ComfyUI's prompt injection but adapted for diffusers.
     It hooks into the cross-attention mechanism to replace conditioning
-    at specific blocks and timesteps.
+    at specific blocks and timesteps with optional spatial control.
     """
     
     def __init__(self, original_processor, block_id: str, conditioning: torch.Tensor, 
-                 weight: float = 1.0, sigma_start: float = 0.0, sigma_end: float = 1.0):
+                 weight: float = 1.0, sigma_start: float = 0.0, sigma_end: float = 1.0,
+                 spatial_mask: Optional[torch.Tensor] = None):
         self.original_processor = original_processor
         self.block_id = block_id  # e.g., "middle:0", "output:1"
         self.conditioning = conditioning
         self.weight = weight
         self.sigma_start = sigma_start  # Higher values (more noise)
         self.sigma_end = sigma_end      # Lower values (less noise)
+        self.spatial_mask = spatial_mask  # Optional spatial mask for regional control
         
         # Parse block info
         if ':' in block_id:
@@ -119,8 +121,6 @@ class PromptInjectionProcessor:
                  timestep: Optional[int] = None,
                  **kwargs) -> torch.Tensor:
         
-        # DEBUG: Log that this processor is being called
-        print(f"PromptInjectionProcessor called for {self.block_id}")
         
         # Get current sigma from timestep if available
         current_sigma = getattr(self, '_current_sigma', None)
@@ -132,13 +132,29 @@ class PromptInjectionProcessor:
             encoder_hidden_states is not None and 
             self.conditioning is not None):
             
-            print(f" INJECTING at block {self.block_id} with weight {self.weight}")
-            # Apply injection similar to ComfyUI approach
-            original_shape = encoder_hidden_states.shape
-            encoder_hidden_states = self._apply_injection(encoder_hidden_states)
-            print(f"   Original shape: {original_shape}, New shape: {encoder_hidden_states.shape}")
+            
+            if self.spatial_mask is not None:
+                # Spatial injection: apply injection and then blend spatially
+                original_shape = encoder_hidden_states.shape
+                injected_states = self._apply_injection(encoder_hidden_states)
+                
+                # Run attention with injected conditioning
+                attention_output = self.original_processor(
+                    attn, hidden_states, injected_states, attention_mask, **kwargs
+                )
+                
+                # Apply spatial masking to blend injection and original
+                return self._apply_spatial_masking(
+                    attention_output, hidden_states, attn, encoder_hidden_states,
+                    attention_mask, timestep, **kwargs
+                )
+            else:
+                # Non-spatial injection: standard approach
+                original_shape = encoder_hidden_states.shape
+                encoder_hidden_states = self._apply_injection(encoder_hidden_states)
         else:
-            print(f"NOT injecting at {self.block_id} (should_inject: {should_inject}, has_conditioning: {self.conditioning is not None})")
+            pass
+            # print(f"NOT injecting at {self.block_id} (should_inject: {should_inject}, has_conditioning: {self.conditioning is not None})")
         
         # Call original processor
         return self.original_processor(
@@ -156,8 +172,9 @@ class PromptInjectionProcessor:
         return current_sigma <= self.sigma_start and current_sigma >= self.sigma_end
     
     def _apply_injection(self, encoder_hidden_states: torch.Tensor) -> torch.Tensor:
-        """Apply the conditioning injection similar to ComfyUI."""
+        """Apply the conditioning injection (for text embeddings only)."""
         batch_size = encoder_hidden_states.shape[0]
+        
         # Ensure conditioning matches the required shape
         if self.conditioning.shape[0] == 1 and batch_size > 1:
             injected_conditioning = self.conditioning.repeat(batch_size, 1, 1)
@@ -170,17 +187,67 @@ class PromptInjectionProcessor:
             dtype=encoder_hidden_states.dtype
         )
         
-        # Instead of replacing entirely, let's try following ComfyUI's approach
-        # ComfyUI replaces only the conditional part (second batch) for CFG
+        # Apply injection with ComfyUI's approach
         if batch_size == 2:
             # Replace only the conditional part (batch 1), keep unconditional (batch 0) 
             result = encoder_hidden_states.clone()
             result[1] = injected_conditioning[0] * self.weight
         else:
-            # Single batch - replace entirely
+            # Single batch: full replacement
             result = injected_conditioning * self.weight
         
         return result
+    
+    def _apply_spatial_masking(self, attention_output: torch.Tensor, 
+                              original_hidden_states: torch.Tensor,
+                              attn: Attention, encoder_hidden_states: torch.Tensor,
+                              attention_mask: Optional[torch.Tensor] = None,
+                              timestep: Optional[int] = None, **kwargs) -> torch.Tensor:
+        """Apply spatial masking to attention output by blending with original."""
+        if self.spatial_mask is None:
+            return attention_output
+        
+        # Run original attention without injection to get baseline
+        original_attention_output = self.original_processor(
+            attn, original_hidden_states, encoder_hidden_states, 
+            attention_mask, timestep, **kwargs
+        )
+        
+        # Prepare spatial mask
+        spatial_mask = self.spatial_mask.to(
+            device=attention_output.device,
+            dtype=attention_output.dtype
+        )
+        
+        # Ensure mask matches spatial dimensions
+        seq_len = attention_output.shape[1]  # Spatial sequence length
+        if spatial_mask.shape[0] != seq_len:
+            if spatial_mask.shape[0] > seq_len:
+                spatial_mask = spatial_mask[:seq_len]
+            else:
+                # Pad or interpolate mask to match sequence length
+                spatial_mask = torch.nn.functional.interpolate(
+                    spatial_mask.unsqueeze(0).unsqueeze(0).float(),
+                    size=(seq_len,), mode='linear', align_corners=False
+                )[0, 0]
+        
+        # Apply spatial mask: blend injection (attention_output) and original  
+        spatial_mask = spatial_mask.unsqueeze(-1)  # Add feature dimension
+        
+        # Broadcast mask for batch size
+        if attention_output.shape[0] > 1:
+            spatial_mask = spatial_mask.unsqueeze(0).expand(attention_output.shape[0], -1, -1)
+        else:
+            spatial_mask = spatial_mask.unsqueeze(0)
+            
+        
+        # Blend: mask=1 uses injection, mask=0 uses original
+        blended_output = (
+            spatial_mask * attention_output + 
+            (1.0 - spatial_mask) * original_attention_output
+        )
+        
+        return blended_output
     
     def set_current_sigma(self, sigma: float):
         """Set current sigma for injection timing control."""
@@ -230,16 +297,18 @@ class UNetPatcher(BaseModelPatcher):
                      conditioning: torch.Tensor,
                      weight: float = 1.0,
                      sigma_start: float = 1.0,  # Changed default to match ComfyUI
-                     sigma_end: float = 0.0):   # Changed default to match ComfyUI
+                     sigma_end: float = 0.0,    # Changed default to match ComfyUI
+                     spatial_mask: Optional[torch.Tensor] = None):
         """
         Add a prompt injection for a specific block or all blocks.
         
         Args:
             block: Block identifier (string like "input:4", "all", or BlockIdentifier)
             conditioning: Conditioning tensor to inject
-            weight: Injection weight
+            weight: Injection weight (1.0 = normal, >1.0 = amplified, <1.0 = weakened)
             sigma_start: Start sigma for injection window (higher noise)
             sigma_end: End sigma for injection window (lower noise)
+            spatial_mask: Optional spatial mask for regional control
         """
         # Handle "all" keyword
         if isinstance(block, str) and block.lower() == "all":
@@ -251,7 +320,8 @@ class UNetPatcher(BaseModelPatcher):
                     'conditioning': conditioning,
                     'weight': weight,
                     'sigma_start': sigma_start,
-                    'sigma_end': sigma_end
+                    'sigma_end': sigma_end,
+                    'spatial_mask': spatial_mask
                 }
             return
         
@@ -271,7 +341,8 @@ class UNetPatcher(BaseModelPatcher):
             'conditioning': conditioning,
             'weight': weight,
             'sigma_start': sigma_start,
-            'sigma_end': sigma_end
+            'sigma_end': sigma_end,
+            'spatial_mask': spatial_mask
         }
     
     def clear_injections(self):
@@ -317,7 +388,8 @@ class UNetPatcher(BaseModelPatcher):
                         conditioning=config['conditioning'],
                         weight=config['weight'],
                         sigma_start=config['sigma_start'],
-                        sigma_end=config['sigma_end']
+                        sigma_end=config['sigma_end'],
+                        spatial_mask=config.get('spatial_mask')
                     )
                     
                     # Store processor for sigma updates
@@ -403,10 +475,10 @@ class UNetPatcher(BaseModelPatcher):
             # Check if this is a cross-attention module
             # In diffusers, cross-attention is usually named 'attn2'
             if hasattr(child, 'processor') and name == 'attn2':
-                print(f"   Found cross-attention: {child_path}")
+                
                 results.append((child_path, child))
             elif hasattr(child, 'processor') and 'cross' in name.lower():
-                print(f"   Found cross-attention: {child_path}")
+               
                 results.append((child_path, child))
             else:
                 # Recurse into child modules
