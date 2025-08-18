@@ -13,7 +13,7 @@ import matplotlib.pyplot as plt
 from diffusers import StableDiffusionPipeline
 
 # Import CorePulse components
-from core_pulse import SimplePromptInjector
+from core_pulse import SimplePromptInjector, AdvancedPromptInjector
 from core_pulse.utils import detect_model_type
 
 
@@ -64,21 +64,36 @@ def cat_vs_dog_comparison():
     original_image = original_result.images[0]
     
     # Reset generator with same seed for fair comparison
-    print(f"\n2. Generating with 'dog' injection into content blocks...")
+    print(f"\n2. Generating with 'dog' injection into ALL blocks...")
     print(f"   Resetting generator to same seed ({seed}) for fair comparison")
     generator = torch.Generator(device=device).manual_seed(seed)
     
-    # Create injector and inject "dog" into content blocks (middle blocks)
-    injector = SimplePromptInjector("sd15")
-    print("   Injecting 'dog' into middle:0 block with weight 1.0")
+    # Create advanced injector for multiple blocks (SimplePromptInjector has a bug with multiple blocks)
+    injector = AdvancedPromptInjector("sd15")
+    print("   Injecting 'dog' into ALL blocks with weight 1.0")
+    
+    # Based on ComfyUI's SD 1.5 block structure, inject into all available blocks
+    # Input blocks (for composition/layout)
+    injector.add_injection("input:4", "dog", weight=1.0)
+    injector.add_injection("input:5", "dog", weight=1.0)
+    injector.add_injection("input:7", "dog", weight=1.0)
+    injector.add_injection("input:8", "dog", weight=1.0)
+    
+    # Middle blocks (for content/subject)
+    injector.add_injection("middle:0", "dog", weight=1.0)
+    injector.add_injection("middle:1", "dog", weight=1.0) 
+    injector.add_injection("middle:2", "dog", weight=1.0)
+    
+    # Output blocks (for style/details)
+    injector.add_injection("output:0", "dog", weight=1.0)
+    injector.add_injection("output:1", "dog", weight=1.0)
+    injector.add_injection("output:2", "dog", weight=1.0)
+    injector.add_injection("output:3", "dog", weight=1.0)
+    injector.add_injection("output:4", "dog", weight=1.0)
+    injector.add_injection("output:5", "dog", weight=1.0)
     
     with injector:
-        modified_pipeline = injector.inject_prompt(
-            pipeline=pipeline,
-            block="middle:0",  # Primary content block
-            prompt="dog",
-            weight=1.0
-        )
+        modified_pipeline = injector.apply_to_pipeline(pipeline)
         
         injected_result = modified_pipeline(
             prompt=base_prompt,

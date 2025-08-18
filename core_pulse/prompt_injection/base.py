@@ -43,6 +43,8 @@ class BasePromptInjector(ABC):
         Returns:
             Encoded prompt tensor
         """
+        print(f" ENCODING PROMPT: '{prompt}'")
+        
         if hasattr(pipeline, 'text_encoder') and hasattr(pipeline, 'tokenizer'):
             # Standard diffusers pipeline
             text_inputs = pipeline.tokenizer(
@@ -53,8 +55,13 @@ class BasePromptInjector(ABC):
                 return_tensors="pt",
             )
             
+            print(f"   Tokenized: {text_inputs.input_ids[0][:10]}...")  # First 10 tokens
+            
             with torch.no_grad():
                 text_embeddings = pipeline.text_encoder(text_inputs.input_ids.to(pipeline.device))[0]
+            
+            print(f"   Encoded shape: {text_embeddings.shape}")
+            print(f"   First few values: {text_embeddings[0, 0, :5]}")
             
             return text_embeddings
         

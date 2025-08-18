@@ -1,11 +1,15 @@
 """
 UNet patching utilities for prompt injection.
+
+This module provides functionality similar to ComfyUI's prompt injection
+but adapted for diffusers pipelines. It patches the UNet's cross-attention
+mechanism to inject conditioning at specific blocks and timesteps.
 """
 
 import torch
-from typing import Dict, Optional, Union, List, Tuple, Any
+from typing import Dict, Optional, Union, List, Tuple, Any, Callable
 from diffusers import UNet2DConditionModel
-from diffusers.models.attention_processor import Attention
+from diffusers.models.attention_processor import Attention, AttnProcessor2_0
 from .base import BaseModelPatcher, BlockIdentifier
 
 
@@ -67,7 +71,8 @@ class UNetBlockMapper:
         if block.block_type == "input":
             return f"down_blocks.{block.block_index}"
         elif block.block_type == "middle": 
-            return f"mid_block.{block.block_index}"
+            # Middle block is just "mid_block", not indexed
+            return "mid_block"
         elif block.block_type == "output":
             return f"up_blocks.{block.block_index}"
         else:
@@ -77,70 +82,173 @@ class UNetBlockMapper:
 class PromptInjectionProcessor:
     """
     Custom attention processor for injecting prompts at specific blocks.
+    
+    This is similar to ComfyUI's prompt injection but adapted for diffusers.
+    It hooks into the cross-attention mechanism to replace conditioning
+    at specific blocks and timesteps.
     """
     
-    def __init__(self, original_processor, injection_data: Dict[str, Any]):
+    def __init__(self, original_processor, block_id: str, conditioning: torch.Tensor, 
+                 weight: float = 1.0, sigma_start: float = 0.0, sigma_end: float = 1.0):
         self.original_processor = original_processor
-        self.injection_data = injection_data
-        self.block_id = injection_data.get('block_id')
-        self.conditioning = injection_data.get('conditioning')
-        self.weight = injection_data.get('weight', 1.0)
-        self.sigma_start = injection_data.get('sigma_start', 0.0)
-        self.sigma_end = injection_data.get('sigma_end', 1.0)
+        self.block_id = block_id  # e.g., "middle:0", "output:1"
+        self.conditioning = conditioning
+        self.weight = weight
+        self.sigma_start = sigma_start  # Higher values (more noise)
+        self.sigma_end = sigma_end      # Lower values (less noise)
+        
+        # Parse block info
+        if ':' in block_id:
+            self.block_type, self.block_index = block_id.split(':')
+            self.block_index = int(self.block_index)
+        else:
+            self.block_type = block_id
+            self.block_index = 0
     
     def __call__(self, attn: Attention, hidden_states: torch.Tensor, 
                  encoder_hidden_states: Optional[torch.Tensor] = None,
                  attention_mask: Optional[torch.Tensor] = None,
-                 **cross_attention_kwargs) -> torch.Tensor:
+                 timestep: Optional[int] = None,
+                 **kwargs) -> torch.Tensor:
         
-        # Check if we should inject at this timestep
-        # Note: In diffusers, we need to get timestep info differently
-        # This is a simplified version - in practice you'd need to pass timestep context
+        # DEBUG: Log that this processor is being called
+        print(f"PromptInjectionProcessor called for {self.block_id}")
         
-        if (encoder_hidden_states is not None and 
-            self.conditioning is not None and 
-            self._should_inject()):
+        # Get current sigma from timestep if available
+        current_sigma = getattr(self, '_current_sigma', None)
+        
+        # Check if we should inject at this timestep/sigma
+        should_inject = self._should_inject(current_sigma)
+        
+        if (should_inject and 
+            encoder_hidden_states is not None and 
+            self.conditioning is not None):
             
-            # Replace the encoder hidden states with our conditioning
-            batch_size = encoder_hidden_states.shape[0]
-            if isinstance(self.conditioning, torch.Tensor):
-                # Ensure conditioning matches batch size
-                if self.conditioning.shape[0] == 1 and batch_size > 1:
-                    injected_conditioning = self.conditioning.repeat(batch_size, 1, 1)
-                else:
-                    injected_conditioning = self.conditioning
-                
-                # Apply weight and blend with original if needed
-                encoder_hidden_states = injected_conditioning * self.weight
+            print(f" INJECTING at block {self.block_id} with weight {self.weight}")
+            # Apply injection similar to ComfyUI approach
+            original_shape = encoder_hidden_states.shape
+            encoder_hidden_states = self._apply_injection(encoder_hidden_states)
+            print(f"   Original shape: {original_shape}, New shape: {encoder_hidden_states.shape}")
+        else:
+            print(f"NOT injecting at {self.block_id} (should_inject: {should_inject}, has_conditioning: {self.conditioning is not None})")
         
         # Call original processor
         return self.original_processor(
-            attn, hidden_states, encoder_hidden_states, attention_mask, 
-            **cross_attention_kwargs
+            attn, hidden_states, encoder_hidden_states, attention_mask, **kwargs
         )
     
-    def _should_inject(self) -> bool:
-        """Determine if we should inject at current timestep."""
-        # Simplified check - in practice this would use actual timestep info
-        return True
+    def _should_inject(self, current_sigma: Optional[float]) -> bool:
+        """Check if we should inject based on current sigma."""
+        if current_sigma is None:
+            # If we don't have sigma info, always inject for now
+            return True
+        
+        # ComfyUI logic: inject if sigma is within range
+        # sigma_start should be > sigma_end (high noise to low noise)
+        return current_sigma <= self.sigma_start and current_sigma >= self.sigma_end
+    
+    def _apply_injection(self, encoder_hidden_states: torch.Tensor) -> torch.Tensor:
+        """Apply the conditioning injection similar to ComfyUI."""
+        batch_size = encoder_hidden_states.shape[0]
+        
+        print(f"   Original conditioning shape: {encoder_hidden_states.shape}")
+        print(f"   Injection conditioning shape: {self.conditioning.shape}")
+        
+        # Debug both halves of the conditioning tensor (CFG has 2 batches)
+        # Look at position 1 (actual content) instead of position 0 (start token)
+        if batch_size == 2:
+            print(f"   Original batch 0 pos0 (uncond start): {encoder_hidden_states[0, 0, :5]}")
+            print(f"   Original batch 0 pos1 (uncond content): {encoder_hidden_states[0, 1, :5]}")
+            print(f"   Original batch 1 pos0 (cond start): {encoder_hidden_states[1, 0, :5]}")
+            print(f"   Original batch 1 pos1 (cond content): {encoder_hidden_states[1, 1, :5]}")
+        else:
+            print(f"   Original batch 0 pos0: {encoder_hidden_states[0, 0, :5]}")
+            print(f"   Original batch 0 pos1: {encoder_hidden_states[0, 1, :5]}")
+        
+        print(f"   Injection pos0 (start): {self.conditioning[0, 0, :5]}")
+        print(f"   Injection pos1 (content): {self.conditioning[0, 1, :5]}")
+        
+        # Ensure conditioning matches the required shape
+        if self.conditioning.shape[0] == 1 and batch_size > 1:
+            injected_conditioning = self.conditioning.repeat(batch_size, 1, 1)
+        else:
+            injected_conditioning = self.conditioning[:batch_size]
+        
+        # Move to same device and dtype
+        injected_conditioning = injected_conditioning.to(
+            device=encoder_hidden_states.device, 
+            dtype=encoder_hidden_states.dtype
+        )
+        
+        # Instead of replacing entirely, let's try following ComfyUI's approach
+        # ComfyUI replaces only the conditional part (second batch) for CFG
+        if batch_size == 2:
+            # Replace only the conditional part (batch 1), keep unconditional (batch 0) 
+            result = encoder_hidden_states.clone()
+            result[1] = injected_conditioning[0] * self.weight
+            print(f"   CFG injection: replaced batch 1 with injection, kept batch 0")
+            print(f"   Result batch 0 pos0 (uncond start): {result[0, 0, :5]}")
+            print(f"   Result batch 0 pos1 (uncond content): {result[0, 1, :5]}")
+            print(f"   Result batch 1 pos0 (cond start): {result[1, 0, :5]}")
+            print(f"   Result batch 1 pos1 (cond content): {result[1, 1, :5]}")
+        else:
+            # Single batch - replace entirely
+            result = injected_conditioning * self.weight
+            print(f"   Single batch injection: replaced entirely")
+            print(f"   Result pos0 (start): {result[0, 0, :5]}")
+            print(f"   Result pos1 (content): {result[0, 1, :5]}")
+        
+        return result
+    
+    def set_current_sigma(self, sigma: float):
+        """Set current sigma for injection timing control."""
+        self._current_sigma = sigma
+
+
+class UNetSigmaHook:
+    """
+    Hook to capture sigma values during sampling for injection timing.
+    """
+    
+    def __init__(self, patcher: 'UNetPatcher'):
+        self.patcher = patcher
+        self.current_sigma = None
+    
+    def __call__(self, module, args, output):
+        """Hook called during UNet forward pass."""
+        # Try to extract sigma from the sampling context
+        # This is a simplified approach - in practice we'd need deeper integration
+        return output
+    
+    def set_sigma(self, sigma: float):
+        """Set current sigma and update all injection processors."""
+        self.current_sigma = sigma
+        for processor in self.patcher._injection_processors.values():
+            processor.set_current_sigma(sigma)
 
 
 class UNetPatcher(BaseModelPatcher):
     """
     Patches UNet models to inject prompts at specific attention blocks.
+    
+    This implementation follows the ComfyUI approach of patching cross-attention
+    mechanisms with proper sigma-based timing control.
     """
     
     def __init__(self, model_type: str = "sdxl"):
         super().__init__()
         self.block_mapper = UNetBlockMapper(model_type)
-        self.injection_configs: Dict[BlockIdentifier, Dict[str, Any]] = {}
+        self.injection_configs: Dict[str, Dict[str, Any]] = {}
         self._original_processors: Dict[str, Any] = {}
+        self._injection_processors: Dict[str, PromptInjectionProcessor] = {}
+        self._sigma_hook = UNetSigmaHook(self)
+        self._hooked_unet = None
     
     def add_injection(self, block: Union[str, BlockIdentifier], 
                      conditioning: torch.Tensor,
                      weight: float = 1.0,
-                     sigma_start: float = 0.0,
-                     sigma_end: float = 1.0):
+                     sigma_start: float = 1.0,  # Changed default to match ComfyUI
+                     sigma_end: float = 0.0):   # Changed default to match ComfyUI
         """
         Add a prompt injection for a specific block.
         
@@ -148,17 +256,21 @@ class UNetPatcher(BaseModelPatcher):
             block: Block identifier (string like "input:4" or BlockIdentifier)
             conditioning: Conditioning tensor to inject
             weight: Injection weight
-            sigma_start: Start sigma for injection window  
-            sigma_end: End sigma for injection window
+            sigma_start: Start sigma for injection window (higher noise)
+            sigma_end: End sigma for injection window (lower noise)
         """
         if isinstance(block, str):
+            block_id = block
             block = BlockIdentifier.from_string(block)
+        else:
+            block_id = f"{block.block_type}:{block.block_index}"
         
         if not self.block_mapper.is_valid_block(block):
             raise ValueError(f"Invalid block: {block}")
         
-        self.injection_configs[block] = {
-            'block_id': block,
+        self.injection_configs[block_id] = {
+            'block': block,
+            'block_id': block_id,
             'conditioning': conditioning,
             'weight': weight,
             'sigma_start': sigma_start,
@@ -168,6 +280,7 @@ class UNetPatcher(BaseModelPatcher):
     def clear_injections(self):
         """Clear all prompt injections."""
         self.injection_configs.clear()
+        self._injection_processors.clear()
     
     def apply_patches(self, unet: UNet2DConditionModel) -> UNet2DConditionModel:
         """
@@ -184,26 +297,44 @@ class UNetPatcher(BaseModelPatcher):
         
         # Store original processors for restoration
         self._original_processors.clear()
+        self._injection_processors.clear()
         
         for block_id, config in self.injection_configs.items():
             try:
-                # Find the attention modules to patch
-                attention_modules = self._find_attention_modules(unet, block_id)
+                # Find the diffusers path for this block
+                block = config['block']
+                diffusers_path = self.block_mapper.map_to_diffusers_path(block)
+                
+                # Find cross-attention modules in this block
+                attention_modules = self._find_cross_attention_modules(unet, diffusers_path)
+                print(f"Found {len(attention_modules)} attention modules for {block_id} at {diffusers_path}")
                 
                 for module_path, attn_module in attention_modules:
+                    print(f"   Patching: {module_path}")
                     # Store original processor
-                    if hasattr(attn_module, 'processor'):
-                        self._original_processors[module_path] = attn_module.processor
-                        
-                        # Create and set custom processor
-                        custom_processor = PromptInjectionProcessor(
-                            attn_module.processor, config
-                        )
-                        attn_module.set_processor(custom_processor)
+                    original_processor = getattr(attn_module, 'processor', AttnProcessor2_0())
+                    self._original_processors[module_path] = original_processor
+                    
+                    # Create custom processor
+                    custom_processor = PromptInjectionProcessor(
+                        original_processor=original_processor,
+                        block_id=block_id,
+                        conditioning=config['conditioning'],
+                        weight=config['weight'],
+                        sigma_start=config['sigma_start'],
+                        sigma_end=config['sigma_end']
+                    )
+                    
+                    # Store processor for sigma updates
+                    self._injection_processors[module_path] = custom_processor
+                    
+                    # Set the custom processor
+                    attn_module.set_processor(custom_processor)
                         
             except Exception as e:
                 print(f"Warning: Failed to patch block {block_id}: {e}")
         
+        self._hooked_unet = unet
         self.is_patched = True
         return unet
     
@@ -235,14 +366,14 @@ class UNetPatcher(BaseModelPatcher):
         self.is_patched = False
         return unet
     
-    def _find_attention_modules(self, unet: UNet2DConditionModel, 
-                              block_id: BlockIdentifier) -> List[Tuple[str, Attention]]:
+    def _find_cross_attention_modules(self, unet: UNet2DConditionModel, 
+                                     diffusers_path: str) -> List[Tuple[str, Attention]]:
         """
-        Find attention modules to patch for a given block.
+        Find cross-attention modules to patch in a specific block.
         
         Args:
             unet: UNet model to search
-            block_id: Block identifier
+            diffusers_path: Diffusers path to the block (e.g., "down_blocks.0")
             
         Returns:
             List of (module_path, attention_module) tuples
@@ -250,52 +381,46 @@ class UNetPatcher(BaseModelPatcher):
         attention_modules = []
         
         try:
-            if block_id.block_type == "input":
-                if hasattr(unet, 'down_blocks') and block_id.block_index < len(unet.down_blocks):
-                    block = unet.down_blocks[block_id.block_index]
-                    modules = self._find_cross_attention_in_block(
-                        block, f"down_blocks.{block_id.block_index}"
-                    )
-                    attention_modules.extend(modules)
+            # Navigate to the target block
+            target_module = unet
+            for attr in diffusers_path.split('.'):
+                if attr.isdigit():
+                    target_module = target_module[int(attr)]
+                else:
+                    target_module = getattr(target_module, attr)
             
-            elif block_id.block_type == "middle":
-                if hasattr(unet, 'mid_block'):
-                    modules = self._find_cross_attention_in_block(
-                        unet.mid_block, "mid_block"
-                    )
-                    attention_modules.extend(modules)
+            # Recursively find cross-attention modules
+            self._collect_cross_attention_modules(target_module, diffusers_path, attention_modules)
             
-            elif block_id.block_type == "output":
-                if hasattr(unet, 'up_blocks') and block_id.block_index < len(unet.up_blocks):
-                    block = unet.up_blocks[block_id.block_index] 
-                    modules = self._find_cross_attention_in_block(
-                        block, f"up_blocks.{block_id.block_index}"
-                    )
-                    attention_modules.extend(modules)
-                    
         except Exception as e:
-            print(f"Error finding attention modules for {block_id}: {e}")
-        
+            print(f"Warning: Could not access {diffusers_path}: {e}")
+            
         return attention_modules
     
-    def _find_cross_attention_in_block(self, block, base_path: str) -> List[Tuple[str, Attention]]:
+    def _collect_cross_attention_modules(self, module, path: str, 
+                                       results: List[Tuple[str, Attention]]):
         """
-        Recursively find cross-attention modules in a block.
-        
-        Args:
-            block: Block module to search
-            base_path: Base path for this block
+        Recursively collect cross-attention modules from a block.
+        """
+        for name, child in module.named_children():
+            child_path = f"{path}.{name}"
             
-        Returns:
-            List of (module_path, attention_module) tuples
+            # Check if this is a cross-attention module
+            # In diffusers, cross-attention is usually named 'attn2'
+            if hasattr(child, 'processor') and name == 'attn2':
+                print(f"   Found cross-attention: {child_path}")
+                results.append((child_path, child))
+            elif hasattr(child, 'processor') and 'cross' in name.lower():
+                print(f"   Found cross-attention: {child_path}")
+                results.append((child_path, child))
+            else:
+                # Recurse into child modules
+                self._collect_cross_attention_modules(child, child_path, results)
+    
+    def set_current_sigma(self, sigma: float):
         """
-        attention_modules = []
-        
-        for name, module in block.named_modules():
-            if isinstance(module, Attention):
-                # Check if this is cross-attention (has encoder_hidden_states)
-                # Cross-attention typically has different dimensions for key/value vs query
-                module_path = f"{base_path}.{name}" if name else base_path
-                attention_modules.append((module_path, module))
-        
-        return attention_modules
+        Set current sigma for all injection processors.
+        This should be called during sampling to enable sigma-based timing control.
+        """
+        for processor in self._injection_processors.values():
+            processor.set_current_sigma(sigma)
