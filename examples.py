@@ -68,29 +68,13 @@ def cat_vs_dog_comparison():
     print(f"   Resetting generator to same seed ({seed}) for fair comparison")
     generator = torch.Generator(device=device).manual_seed(seed)
     
-    # Create advanced injector for multiple blocks (SimplePromptInjector has a bug with multiple blocks)
+    # Create advanced injector and use the new "all" feature!
     injector = AdvancedPromptInjector("sd15")
-    print("   Injecting 'dog' into ALL blocks with weight 1.0")
+    print("   Injecting 'dog' into ALL blocks with weight 1.0 using smart 'all' feature")
     
-    # Based on ComfyUI's SD 1.5 block structure, inject into all available blocks
-    # Input blocks (for composition/layout)
-    injector.add_injection("input:4", "dog", weight=1.0)
-    injector.add_injection("input:5", "dog", weight=1.0)
-    injector.add_injection("input:7", "dog", weight=1.0)
-    injector.add_injection("input:8", "dog", weight=1.0)
-    
-    # Middle blocks (for content/subject)
-    injector.add_injection("middle:0", "dog", weight=1.0)
-    injector.add_injection("middle:1", "dog", weight=1.0) 
-    injector.add_injection("middle:2", "dog", weight=1.0)
-    
-    # Output blocks (for style/details)
-    injector.add_injection("output:0", "dog", weight=1.0)
-    injector.add_injection("output:1", "dog", weight=1.0)
-    injector.add_injection("output:2", "dog", weight=1.0)
-    injector.add_injection("output:3", "dog", weight=1.0)
-    injector.add_injection("output:4", "dog", weight=1.0)
-    injector.add_injection("output:5", "dog", weight=1.0)
+    # NEW FEATURE: Use "all" to inject into all available blocks for SD 1.5
+    # This replaces the need to specify each block individually!
+    injector.add_injection("all", "dog", weight=1.0)
     
     with injector:
         modified_pipeline = injector.apply_to_pipeline(pipeline)

@@ -35,10 +35,10 @@ class SimplePromptInjector(BasePromptInjector):
                            sigma_start: float = 0.0,
                            sigma_end: float = 1.0):
         """
-        Configure prompt injection for one or more blocks.
+        Configure prompt injection for one or more blocks, or all blocks.
         
         Args:
-            block: Block identifier(s) to inject into
+            block: Block identifier(s) to inject into (supports "all" for all blocks)
             prompt: Prompt to inject
             weight: Injection weight (default: 1.0)
             sigma_start: Start of injection window (default: 0.0)  
@@ -46,8 +46,13 @@ class SimplePromptInjector(BasePromptInjector):
         """
         self.clear_injections()
         
-        # Handle single block or list of blocks
-        blocks = block if isinstance(block, list) else [block]
+        # Handle "all" keyword
+        if isinstance(block, str) and block.lower() == "all":
+            blocks = self.patcher.block_mapper.get_all_block_identifiers()
+        elif isinstance(block, list):
+            blocks = block
+        else:
+            blocks = [block]
         
         for b in blocks:
             config = PromptInjectionConfig(
@@ -71,7 +76,7 @@ class SimplePromptInjector(BasePromptInjector):
         
         Args:
             pipeline: Diffusion pipeline to modify
-            block: Block identifier(s) to inject into
+            block: Block identifier(s) to inject into (supports "all" for all blocks)
             prompt: Prompt to inject
             weight: Injection weight (default: 1.0)
             sigma_start: Start of injection window (default: 0.0)

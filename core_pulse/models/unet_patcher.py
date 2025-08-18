@@ -26,9 +26,9 @@ class UNetBlockMapper:
     }
     
     SD15_BLOCKS = {
-        'input': [3, 4, 5, 6, 7, 8, 9, 10, 11],
+        'input': [3],  # SD 1.5 has input blocks but fewer cross-attention layers
         'middle': [0, 1, 2],
-        'output': [0, 1, 2, 3, 4, 5, 6, 7, 8]
+        'output': [0, 1, 2, 3]  # SD 1.5 has output blocks 0-3 with cross-attention
     }
     
     def __init__(self, model_type: str = "sdxl"):
@@ -49,6 +49,14 @@ class UNetBlockMapper:
     def get_valid_blocks(self) -> Dict[str, List[int]]:
         """Get all valid blocks for this model type."""
         return self.blocks.copy()
+    
+    def get_all_block_identifiers(self) -> List[str]:
+        """Get all valid block identifiers as strings for this model type."""
+        all_blocks = []
+        for block_type, block_indices in self.blocks.items():
+            for block_index in block_indices:
+                all_blocks.append(f"{block_type}:{block_index}")
+        return all_blocks
     
     def is_valid_block(self, block: BlockIdentifier) -> bool:
         """Check if a block identifier is valid for this model."""
@@ -150,24 +158,6 @@ class PromptInjectionProcessor:
     def _apply_injection(self, encoder_hidden_states: torch.Tensor) -> torch.Tensor:
         """Apply the conditioning injection similar to ComfyUI."""
         batch_size = encoder_hidden_states.shape[0]
-        
-        print(f"   Original conditioning shape: {encoder_hidden_states.shape}")
-        print(f"   Injection conditioning shape: {self.conditioning.shape}")
-        
-        # Debug both halves of the conditioning tensor (CFG has 2 batches)
-        # Look at position 1 (actual content) instead of position 0 (start token)
-        if batch_size == 2:
-            print(f"   Original batch 0 pos0 (uncond start): {encoder_hidden_states[0, 0, :5]}")
-            print(f"   Original batch 0 pos1 (uncond content): {encoder_hidden_states[0, 1, :5]}")
-            print(f"   Original batch 1 pos0 (cond start): {encoder_hidden_states[1, 0, :5]}")
-            print(f"   Original batch 1 pos1 (cond content): {encoder_hidden_states[1, 1, :5]}")
-        else:
-            print(f"   Original batch 0 pos0: {encoder_hidden_states[0, 0, :5]}")
-            print(f"   Original batch 0 pos1: {encoder_hidden_states[0, 1, :5]}")
-        
-        print(f"   Injection pos0 (start): {self.conditioning[0, 0, :5]}")
-        print(f"   Injection pos1 (content): {self.conditioning[0, 1, :5]}")
-        
         # Ensure conditioning matches the required shape
         if self.conditioning.shape[0] == 1 and batch_size > 1:
             injected_conditioning = self.conditioning.repeat(batch_size, 1, 1)
@@ -186,17 +176,9 @@ class PromptInjectionProcessor:
             # Replace only the conditional part (batch 1), keep unconditional (batch 0) 
             result = encoder_hidden_states.clone()
             result[1] = injected_conditioning[0] * self.weight
-            print(f"   CFG injection: replaced batch 1 with injection, kept batch 0")
-            print(f"   Result batch 0 pos0 (uncond start): {result[0, 0, :5]}")
-            print(f"   Result batch 0 pos1 (uncond content): {result[0, 1, :5]}")
-            print(f"   Result batch 1 pos0 (cond start): {result[1, 0, :5]}")
-            print(f"   Result batch 1 pos1 (cond content): {result[1, 1, :5]}")
         else:
             # Single batch - replace entirely
             result = injected_conditioning * self.weight
-            print(f"   Single batch injection: replaced entirely")
-            print(f"   Result pos0 (start): {result[0, 0, :5]}")
-            print(f"   Result pos1 (content): {result[0, 1, :5]}")
         
         return result
     
@@ -250,15 +232,30 @@ class UNetPatcher(BaseModelPatcher):
                      sigma_start: float = 1.0,  # Changed default to match ComfyUI
                      sigma_end: float = 0.0):   # Changed default to match ComfyUI
         """
-        Add a prompt injection for a specific block.
+        Add a prompt injection for a specific block or all blocks.
         
         Args:
-            block: Block identifier (string like "input:4" or BlockIdentifier)
+            block: Block identifier (string like "input:4", "all", or BlockIdentifier)
             conditioning: Conditioning tensor to inject
             weight: Injection weight
             sigma_start: Start sigma for injection window (higher noise)
             sigma_end: End sigma for injection window (lower noise)
         """
+        # Handle "all" keyword
+        if isinstance(block, str) and block.lower() == "all":
+            all_blocks = self.block_mapper.get_all_block_identifiers()
+            for block_id in all_blocks:
+                self.injection_configs[block_id] = {
+                    'block': BlockIdentifier.from_string(block_id),
+                    'block_id': block_id,
+                    'conditioning': conditioning,
+                    'weight': weight,
+                    'sigma_start': sigma_start,
+                    'sigma_end': sigma_end
+                }
+            return
+        
+        # Handle single block
         if isinstance(block, str):
             block_id = block
             block = BlockIdentifier.from_string(block)
@@ -307,10 +304,8 @@ class UNetPatcher(BaseModelPatcher):
                 
                 # Find cross-attention modules in this block
                 attention_modules = self._find_cross_attention_modules(unet, diffusers_path)
-                print(f"Found {len(attention_modules)} attention modules for {block_id} at {diffusers_path}")
                 
                 for module_path, attn_module in attention_modules:
-                    print(f"   Patching: {module_path}")
                     # Store original processor
                     original_processor = getattr(attn_module, 'processor', AttnProcessor2_0())
                     self._original_processors[module_path] = original_processor

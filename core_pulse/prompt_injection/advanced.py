@@ -68,15 +68,31 @@ class AdvancedPromptInjector(BasePromptInjector):
                      sigma_start: float = 0.0,
                      sigma_end: float = 1.0):
         """
-        Add a single prompt injection.
+        Add a single prompt injection or inject into all blocks.
         
         Args:
-            block: Block identifier
+            block: Block identifier (string like "input:4", "all", or BlockIdentifier)
             prompt: Prompt to inject
             weight: Injection weight
             sigma_start: Start of injection window
             sigma_end: End of injection window
         """
+        # Handle "all" keyword
+        if isinstance(block, str) and block.lower() == "all":
+            all_blocks = self.patcher.block_mapper.get_all_block_identifiers()
+            for block_id_str in all_blocks:
+                config = PromptInjectionConfig(
+                    block=block_id_str,
+                    prompt=prompt,
+                    weight=weight,
+                    sigma_start=sigma_start,
+                    sigma_end=sigma_end
+                )
+                block_id = BlockIdentifier.from_string(block_id_str)
+                self.configs[block_id] = config
+            return
+        
+        # Handle single block
         config = PromptInjectionConfig(
             block=block,
             prompt=prompt,

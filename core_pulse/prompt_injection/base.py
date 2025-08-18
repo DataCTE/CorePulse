@@ -6,7 +6,6 @@ from abc import ABC, abstractmethod
 from typing import Dict, List, Union, Optional, Any
 import torch
 from diffusers import DiffusionPipeline
-from transformers import CLIPTextModel, CLIPTokenizer
 
 from ..models.base import BlockIdentifier
 from ..models.unet_patcher import UNetPatcher
