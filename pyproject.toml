@@ -9,14 +9,13 @@ dependencies = [
     "torchvision==0.20.1+cu124",
     "diffusers",
     "transformers",
-]
-
-[project.optional-dependencies]
-examples = [
     "accelerate",
     "safetensors",
     "Pillow",
+    "matplotlib",
 ]
+
+[project.optional-dependencies]
 dev = [
     "pytest",
     "black",

@@ -9,7 +9,8 @@ from .helpers import (
     detect_model_type,
     create_quick_injector,
     inject_and_generate,
-    get_available_blocks
+    get_available_blocks,
+    demonstrate_content_style_split
 )
 
 __all__ = [
@@ -17,4 +18,5 @@ __all__ = [
     "create_quick_injector", 
     "inject_and_generate",
     "get_available_blocks",
+    "demonstrate_content_style_split",
 ]
