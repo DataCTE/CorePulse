@@ -191,6 +191,13 @@ class PromptInjectionProcessor:
         if batch_size == 2:
             # Replace only the conditional part (batch 1), keep unconditional (batch 0) 
             result = encoder_hidden_states.clone()
+            # Ensure injected conditioning matches the shape of the target
+            if injected_conditioning.shape[-1] != result.shape[-1]:
+                # This can happen if injecting SD1.5 conditioning into an SDXL model or vice-versa
+                # We will simply not inject in this case to avoid crashing.
+                # A more sophisticated solution could involve projection.
+                return result
+
             result[1] = injected_conditioning[0] * self.weight
         else:
             # Single batch: full replacement

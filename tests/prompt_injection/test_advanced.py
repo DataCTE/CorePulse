@@ -1,40 +1,13 @@
 import pytest
 import torch
+import numpy as np
 from unittest.mock import MagicMock
+from diffusers import StableDiffusionPipeline, StableDiffusionXLPipeline
 
 from core_pulse.prompt_injection.advanced import AdvancedPromptInjector
 from core_pulse.models.base import BlockIdentifier
 
-# --- Mock Objects ---
-
-class MockTokenizer:
-    def __call__(self, text, padding, max_length, truncation, return_tensors):
-        mock_input_ids = torch.randint(0, 1000, (1, 77))
-        return {"input_ids": mock_input_ids}
-
-    @property
-    def model_max_length(self):
-        return 77
-
-class MockTextEncoder:
-    def __call__(self, input_ids, attention_mask=None):
-        return [torch.randn(1, 77, 768)] # SD1.5 embedding dim
-
-class MockUNet:
-    def __init__(self):
-        # Create a mock structure that the patcher can traverse
-        self.down_blocks = [MagicMock(), MagicMock(), MagicMock(), MagicMock(), MagicMock(), MagicMock(), MagicMock(), MagicMock(), MagicMock()]
-        self.mid_block = MagicMock()
-        self.up_blocks = [MagicMock(), MagicMock(), MagicMock(), MagicMock(), MagicMock(), MagicMock()]
-
-class MockPipeline:
-    def __init__(self):
-        self.tokenizer = MockTokenizer()
-        self.text_encoder = MockTextEncoder()
-        self.unet = MockUNet()
-        self.device = 'cpu'
-
-# --- Tests ---
+# --- Fixtures ---
 
 @pytest.fixture
 def injector():
@@ -46,6 +19,37 @@ def injector():
         'output': [0, 1, 2] # Simplified for testing
     }
     return injector
+
+@pytest.fixture(scope="session")
+def sd15_pipeline():
+    """Load a real SD 1.5 pipeline. This is slow and will be cached."""
+    try:
+        pipeline = StableDiffusionPipeline.from_pretrained(
+            "runwayml/stable-diffusion-v1-5", 
+            torch_dtype=torch.float16,
+            safety_checker=None
+        )
+        pipeline.to("cuda" if torch.cuda.is_available() else "cpu")
+        return pipeline
+    except Exception as e:
+        pytest.skip(f"Could not load SD 1.5 pipeline, skipping integration test: {e}")
+
+@pytest.fixture(scope="session")
+def sdxl_pipeline():
+    """Load a real SDXL pipeline. This is slow and will be cached."""
+    try:
+        pipeline = StableDiffusionXLPipeline.from_pretrained(
+            "stabilityai/stable-diffusion-xl-base-1.0", 
+            torch_dtype=torch.float16,
+            variant="fp16",
+            use_safetensors=True
+        )
+        pipeline.to("cuda" if torch.cuda.is_available() else "cpu")
+        return pipeline
+    except Exception as e:
+        pytest.skip(f"Could not load SDXL pipeline, skipping integration test: {e}")
+
+# --- Tests ---
 
 def test_advanced_injector_add_single_injection(injector):
     """Test adding a single injection."""
@@ -87,3 +91,71 @@ def test_advanced_injector_configure_injections(injector):
     assert block2_id in injector.configs
     assert injector.configs[block2_id].prompt == "second prompt"
     assert injector.configs[block2_id].sigma_start == 0.8
+
+@pytest.mark.slow
+def test_advanced_injector_influences_output(sd15_pipeline):
+    """Integration test to ensure injection actually changes the image output."""
+    prompt = "a photograph of an astronaut riding a horse"
+    generator = torch.Generator(device=sd15_pipeline.device).manual_seed(42)
+
+    # Generate base image
+    base_image_pil = sd15_pipeline(
+        prompt, 
+        generator=generator,
+        num_inference_steps=2, # Keep it fast
+        output_type="pil"
+    ).images[0]
+    base_image = np.array(base_image_pil)
+
+    # Generate injected image
+    injector = AdvancedPromptInjector(model_type="sd15")
+    injector.add_injection("all", "in a surrealist style", weight=2.0)
+    
+    generator.manual_seed(42) # Reset seed
+    with injector:
+        injector.apply_to_pipeline(sd15_pipeline)
+        injected_image_pil = injector(
+            prompt,
+            generator=generator,
+            num_inference_steps=2,
+            output_type="pil"
+        ).images[0]
+    injected_image = np.array(injected_image_pil)
+
+    # Ensure the images are different
+    assert not np.array_equal(base_image, injected_image), \
+        "Injected image is identical to the base image, meaning injection had no effect."
+
+@pytest.mark.slow
+def test_advanced_injector_influences_output_sdxl(sdxl_pipeline):
+    """Integration test to ensure injection actually changes the image output for SDXL."""
+    prompt = "a photograph of an astronaut riding a horse"
+    generator = torch.Generator(device=sdxl_pipeline.device).manual_seed(42)
+
+    # Generate base image
+    base_image_pil = sdxl_pipeline(
+        prompt, 
+        generator=generator,
+        num_inference_steps=2, # Keep it fast
+        output_type="pil"
+    ).images[0]
+    base_image = np.array(base_image_pil)
+
+    # Generate injected image
+    injector = AdvancedPromptInjector(model_type="sdxl")
+    injector.add_injection("all", "in a surrealist style", weight=2.0)
+    
+    generator.manual_seed(42) # Reset seed
+    with injector:
+        injector.apply_to_pipeline(sdxl_pipeline)
+        injected_image_pil = injector(
+            prompt,
+            generator=generator,
+            num_inference_steps=2,
+            output_type="pil"
+        ).images[0]
+    injected_image = np.array(injected_image_pil)
+
+    # Ensure the images are different
+    assert not np.array_equal(base_image, injected_image), \
+        "Injected image is identical to the base image, meaning injection had no effect."

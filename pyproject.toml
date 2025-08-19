@@ -26,6 +26,18 @@ dev = [
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
+[tool.pytest.ini_options]
+markers = [
+    "slow: marks tests as slow to run",
+]
+
+[tool.uv]
+dev-dependencies = [
+    "pytest",
+    "black",
+    "flake8",
+]
+
 [tool.uv.sources]
 torch = { index = "pytorch-cu124" }
 torchvision = { index = "pytorch-cu124" }

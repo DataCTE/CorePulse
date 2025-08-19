@@ -42,42 +42,13 @@ class BasePromptInjector(ABC):
         Returns:
             Encoded prompt tensor
         """
-        
-        if hasattr(pipeline, 'text_encoder') and hasattr(pipeline, 'tokenizer'):
-            # Standard diffusers pipeline
-            text_inputs = pipeline.tokenizer(
-                prompt,
-                padding="max_length",
-                max_length=pipeline.tokenizer.model_max_length,
-                truncation=True,
-                return_tensors="pt",
-            )
-            
-            
-            with torch.no_grad():
-                text_embeddings = pipeline.text_encoder(text_inputs.input_ids.to(pipeline.device))[0]
-            
-            
-            return text_embeddings
-        
-        elif hasattr(pipeline, 'text_encoder_2'):
-            # SDXL pipeline with dual text encoders
-            # Use the primary text encoder for simplicity
-            text_inputs = pipeline.tokenizer(
-                prompt,
-                padding="max_length", 
-                max_length=pipeline.tokenizer.model_max_length,
-                truncation=True,
-                return_tensors="pt",
-            )
-            
-            with torch.no_grad():
-                text_embeddings = pipeline.text_encoder(text_inputs.input_ids.to(pipeline.device))[0]
-            
-            return text_embeddings
-        
-        else:
-            raise ValueError("Pipeline must have text_encoder and tokenizer")
+        prompt_embeds = pipeline.encode_prompt(
+            prompt=prompt,
+            device=pipeline.device,
+            num_images_per_prompt=1,
+            do_classifier_free_guidance=False, # We only need the conditional part
+        )[0]
+        return prompt_embeds
     
     def encode_prompts(self, prompts: Union[str, List[str]], 
                       pipeline: DiffusionPipeline) -> torch.Tensor:
@@ -125,7 +96,7 @@ class BasePromptInjector(ABC):
         self.patcher.apply_patches(pipeline.unet)
         self._is_applied = True
         
-        return pipeline
+        return self
     
     def remove_from_pipeline(self) -> Optional[DiffusionPipeline]:
         """
@@ -148,6 +119,12 @@ class BasePromptInjector(ABC):
         """Clear all configured injections."""
         self.patcher.clear_injections()
     
+    def __call__(self, *args, **kwargs):
+        """Make the injector callable to pass through to the pipeline."""
+        if not self._is_applied or self._pipeline is None:
+            raise RuntimeError("Injector has not been applied to a pipeline.")
+        return self._pipeline(*args, **kwargs)
+
     def __enter__(self):
         """Context manager entry."""
         return self
