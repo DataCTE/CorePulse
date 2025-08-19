@@ -20,9 +20,9 @@ class UNetBlockMapper:
     
     # Block mappings for different model architectures
     SDXL_BLOCKS = {
-        'input': [4, 5, 7, 8],
-        'middle': [0], 
-        'output': [0, 1, 2, 3, 4, 5]
+        'input': [1, 2],
+        'middle': [0],
+        'output': [0, 1]
     }
     
     SD15_BLOCKS = {

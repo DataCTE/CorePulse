@@ -9,258 +9,211 @@ import torch
 import numpy as np
 from typing import Dict, List, Union, Optional, Tuple, Any
 from diffusers import DiffusionPipeline
-from enum import Enum
+from torchvision.transforms import functional as F
+from PIL import Image
 
-from .masking import MaskedPromptInjector, TokenMask, TokenAnalyzer, MaskedPromptEncoder
+from .masking import MaskedPromptInjector
 from ..models.base import BlockIdentifier
-from .composition import RegionalComposition, CompositionLayer, BlendMode, MaskFactory
 
 
-class CoordinateMapper:
+class MaskFactory:
     """
-    Maps between different coordinate systems: pixel space, latent space, attention space.
+    A utility class providing static methods to create and manipulate spatial masks.
+    
+    Masks are returned as torch.Tensors with float values between 0.0 and 1.0.
     """
     
-    def __init__(self, 
-                 image_size: Tuple[int, int] = (512, 512),
-                 latent_size: Tuple[int, int] = (64, 64)):
+    @staticmethod
+    def from_shape(shape_type: str,
+                   image_size: Tuple[int, int] = (1024, 1024),
+                   **params) -> torch.Tensor:
         """
-        Initialize coordinate mapper.
-        
-        Args:
-            image_size: Pixel image size (width, height)
-            latent_size: Latent space size (width, height)
+        Create a mask from a predefined shape.
         """
-        self.image_size = image_size
-        self.latent_size = latent_size
+        height, width = image_size[1], image_size[0]
+        mask = torch.zeros((height, width), dtype=torch.float32)
         
-        # Calculate scaling factors
-        self.latent_scale_x = latent_size[0] / image_size[0]
-        self.latent_scale_y = latent_size[1] / image_size[1]
-    
-    def pixel_to_latent(self, pixel_coords: Tuple[int, int]) -> Tuple[int, int]:
-        """Convert pixel coordinates to latent coordinates."""
-        px, py = pixel_coords
-        lx = int(px * self.latent_scale_x)
-        ly = int(py * self.latent_scale_y)
-        return (lx, ly)
-    
-    def latent_to_attention_index(self, latent_coords: Tuple[int, int]) -> int:
-        """Convert latent coordinates to 1D attention token index."""
-        lx, ly = latent_coords
-        # Standard row-major indexing
-        return ly * self.latent_size[0] + lx
-    
-    def pixel_to_attention_index(self, pixel_coords: Tuple[int, int]) -> int:
-        """Convert pixel coordinates directly to attention token index."""
-        latent_coords = self.pixel_to_latent(pixel_coords)
-        return self.latent_to_attention_index(latent_coords)
+        shape_type = shape_type.lower()
 
+        if shape_type == 'rectangle':
+            x, y, w, h = params['x'], params['y'], params['width'], params['height']
+            x1, y1 = max(0, x), max(0, y)
+            x2, y2 = min(width, x + w), min(height, y + h)
+            mask[y1:y2, x1:x2] = 1.0
+        
+        elif shape_type == 'circle':
+            cx, cy, radius = params['cx'], params['cy'], params['radius']
+            y_coords = torch.arange(height)
+            x_coords = torch.arange(width)
+            y_grid, x_grid = torch.meshgrid(y_coords, x_coords, indexing='ij')
+            dist = torch.sqrt((x_grid - cx)**2 + (y_grid - cy)**2)
+            mask[dist <= radius] = 1.0
+            
+        elif shape_type == 'ellipse':
+            cx, cy = params['cx'], params['cy']
+            w, h = params['width'], params['height']
+            y_coords = torch.arange(height)
+            x_coords = torch.arange(width)
+            y_grid, x_grid = torch.meshgrid(y_coords, x_coords, indexing='ij')
+            ellipse_mask = ((x_grid - cx) / (w / 2))**2 + ((y_grid - cy) / (h / 2))**2 <= 1
+            mask[ellipse_mask] = 1.0
+            
+        else:
+            raise ValueError(f"Unsupported shape_type: {shape_type}")
+            
+        return mask
 
-# class RegionalInjectionConfig:
-#     """
-#     Configuration for regional prompt injection combining spatial and token masking.
-#     """
-    
-#     def __init__(self,
-#                  spatial_mask: SpatialMask,
-#                  base_prompt: str,
-#                  injection_prompt: str,
-#                  target_phrase: Optional[str] = None,
-#                  weight: float = 1.0,
-#                  sigma_start: float = 0.0,
-#                  sigma_end: float = 1.0,
-#                  fuzzy_match: bool = True):
-#         """
-#         Initialize regional injection configuration.
+    @staticmethod
+    def from_image(image_path: str,
+                   image_size: Optional[Tuple[int, int]] = None) -> torch.Tensor:
+        """
+        Load a mask from an image file.
+        """
+        try:
+            mask_image = Image.open(image_path).convert('L')
+        except FileNotFoundError:
+            raise FileNotFoundError(f"Mask image not found at: {image_path}")
+
+        if image_size:
+            mask_image = mask_image.resize(image_size, Image.LANCZOS)
+            
+        mask_np = np.array(mask_image).astype(np.float32) / 255.0
+        return torch.from_numpy(mask_np)
+
+    @staticmethod
+    def gaussian_blur(mask: torch.Tensor, kernel_size: int = 5, sigma: float = 1.0) -> torch.Tensor:
+        """
+        Apply a Gaussian blur to soften the edges of a mask.
+        """
+        if mask.ndim == 2:
+            mask = mask.unsqueeze(0).unsqueeze(0)
         
-#         Args:
-#             spatial_mask: Spatial mask defining the region
-#             base_prompt: Original prompt
-#             injection_prompt: Prompt with replacement content
-#             target_phrase: Specific phrase to replace (if None, replaces entire prompt)
-#             weight: Injection weight (1.0 = normal, >1.0 = amplified, <1.0 = weakened)
-#             sigma_start: Start of injection window
-#             sigma_end: End of injection window  
-#             fuzzy_match: Whether to use fuzzy phrase matching
-#         """
-#         self.spatial_mask = spatial_mask
-#         self.base_prompt = base_prompt
-#         self.injection_prompt = injection_prompt
-#         self.target_phrase = target_phrase
-#         self.weight = weight
-#         self.sigma_start = sigma_start
-#         self.sigma_end = sigma_end
-#         self.fuzzy_match = fuzzy_match
+        if kernel_size % 2 == 0:
+            kernel_size += 1
+            
+        blurred_mask = F.gaussian_blur(mask, kernel_size=[kernel_size, kernel_size], sigma=[sigma, sigma])
         
-#         # Cache for processed masks and embeddings
-#         self._token_mask: Optional[TokenMask] = None
-#         self._attention_mask: Optional[torch.Tensor] = None
-#         self._blended_embedding: Optional[torch.Tensor] = None
+        return blurred_mask.squeeze(0).squeeze(0)
+
+    @staticmethod
+    def gradient(gradient_type: str,
+                 image_size: Tuple[int, int] = (1024, 1024),
+                 **params) -> torch.Tensor:
+        """
+        Create a linear or radial gradient mask.
+        """
+        height, width = image_size[1], image_size[0]
+        gradient_type = gradient_type.lower()
+        
+        if gradient_type == 'linear':
+            start_val = params.get('start_val', 0.0)
+            end_val = params.get('end_val', 1.0)
+            direction = params.get('direction', 'horizontal')
+            
+            if direction == 'horizontal':
+                grad_vector = torch.linspace(start_val, end_val, width)
+                return grad_vector.repeat(height, 1)
+            elif direction == 'vertical':
+                grad_vector = torch.linspace(start_val, end_val, height)
+                return grad_vector.unsqueeze(-1).repeat(1, width)
+            else:
+                raise ValueError(f"Unsupported linear gradient direction: {direction}")
+
+        elif gradient_type == 'radial':
+            cx = params.get('cx', width // 2)
+            cy = params.get('cy', height // 2)
+            radius = params.get('radius', min(width, height) / 2)
+            start_val = params.get('start_val', 1.0)
+            end_val = params.get('end_val', 0.0)
+            
+            y_coords = torch.arange(height)
+            x_coords = torch.arange(width)
+            y_grid, x_grid = torch.meshgrid(y_coords, x_coords, indexing='ij')
+            dist = torch.sqrt((x_grid - cx)**2 + (y_grid - cy)**2)
+            
+            grad = dist / radius
+            grad = torch.clamp(grad, 0, 1)
+            
+            grad = start_val + (end_val - start_val) * grad
+            return torch.clamp(grad, 0, 1)
+
+        else:
+            raise ValueError(f"Unsupported gradient_type: {gradient_type}")
+
+    @staticmethod
+    def invert(mask: torch.Tensor) -> torch.Tensor:
+        """
+        Invert a mask (1.0 - mask).
+        """
+        return 1.0 - mask
+
+    @staticmethod
+    def combine(mask1: torch.Tensor,
+                mask2: torch.Tensor,
+                operation: str) -> torch.Tensor:
+        """
+        Combine two masks using a boolean-like operation.
+        """
+        operation = operation.lower()
+        if operation == 'add':
+            return torch.max(mask1, mask2)
+        elif operation == 'subtract':
+            return torch.clamp(mask1 - mask2, 0, 1)
+        elif operation == 'multiply':
+            return torch.min(mask1, mask2)
+        else:
+            raise ValueError(f"Unsupported operation: {operation}")
 
 
 class RegionalPromptInjector(MaskedPromptInjector):
     """
-    Advanced prompt injector with both token-level and spatial masking capabilities.
-    
-    Allows applying different prompt injections to specific regions of the image
-    while optionally targeting specific phrases within those regions.
+    Advanced prompt injector with spatial masking capabilities.
     """
     
     def __init__(self, model_type: str = "sdxl"):
-        """
-        Initialize regional prompt injector.
-        
-        Args:
-            model_type: Model type ("sdxl" or "sd15")
-        """
         super().__init__(model_type)
-        # self.regional_configs: Dict[str, RegionalInjectionConfig] = {}
-        self.coord_mapper: Optional[CoordinateMapper] = None
         
-        # Determine latent and attention sizes based on model type
         if model_type.lower() == "sd15":
-            self.image_size = (512, 512)
-            self.latent_size = (64, 64)
-            self.attention_resolution = 64  # 64x64 = 4096 tokens
+            self.attention_resolution = 64
         elif model_type.lower() == "sdxl":
-            self.image_size = (1024, 1024)
-            self.latent_size = (128, 128) 
-            self.attention_resolution = 128  # 128x128 = 16384 tokens
+            self.attention_resolution = 128
         else:
             raise ValueError(f"Unsupported model type: {model_type}")
-            
-        self.coord_mapper = CoordinateMapper(self.image_size, self.latent_size)
-        self.composition = RegionalComposition(self.image_size)
-    
-    def add_regional_layer(self,
-                           prompt: str,
-                           mask: torch.Tensor,
-                           blend_mode: BlendMode = BlendMode.REPLACE,
-                           opacity: float = 1.0,
-                           weight: float = 1.0,
-                           sigma_start: float = 0.0,
-                           sigma_end: float = 1.0,
-                           block: Union[str, BlockIdentifier] = "all"):
+
+    def add_regional_injection(self,
+                               block: Union[str, BlockIdentifier],
+                               prompt: str,
+                               mask: torch.Tensor,
+                               weight: float = 1.0,
+                               sigma_start: float = 0.0,
+                               sigma_end: float = 1.0):
         """
-        Adds a compositional layer for regional injection.
+        Adds a spatially-masked prompt injection.
 
         Args:
+            block: The UNet block(s) to apply this injection to.
             prompt: The text prompt for this layer.
             mask: A float tensor (0.0-1.0) representing the spatial mask.
-            blend_mode: How to blend this layer with underlying layers.
-            opacity: The overall influence of this layer (0.0 to 1.0).
             weight: Injection weight for conditioning.
             sigma_start: Start of the injection window in the diffusion process.
             sigma_end: End of the injection window.
-            block: The UNet block(s) to apply this injection to.
         """
-        # Ensure mask is resized to attention resolution and flattened
+        # Resize mask to the attention resolution and flatten
         attention_mask = torch.nn.functional.interpolate(
             mask.unsqueeze(0).unsqueeze(0),
             size=(self.attention_resolution, self.attention_resolution),
             mode='bilinear',
             align_corners=False
-        ).squeeze(0).squeeze(0)
+        ).squeeze(0).squeeze(0).flatten()
 
-        layer = CompositionLayer(
+        self.add_injection(
+            block=block,
             prompt=prompt,
-            mask=attention_mask.flatten(), # Flatten for 1D attention tokens
-            blend_mode=blend_mode,
-            opacity=opacity,
             weight=weight,
             sigma_start=sigma_start,
-            sigma_end=sigma_end
+            sigma_end=sigma_end,
+            spatial_mask=attention_mask
         )
-        self.composition.add_layer(layer)
-        
-        # Store block info separately for apply_to_pipeline
-        # This is a bit of a hack; a cleaner way might be to integrate blocks into the composition
-        if not hasattr(self, '_layer_blocks'):
-            self._layer_blocks = []
-        self._layer_blocks.append(block)
-
-        
-    # def get_regional_summary(self) -> List[Dict[str, Any]]:
-    #     """
-    #     Get summary of all regional injection configurations.
-        
-    #     Returns:
-    #         List of regional injection summaries
-    #     """
-    #     summaries = []
-    #     for config_id, config in self.regional_configs.items():
-    #         summary = {
-    #             "config_id": config_id,
-    #             "region_type": config.spatial_mask.region_type.value,
-    #             "region_params": config.spatial_mask.region_params,
-    #             "base_prompt": config.base_prompt,
-    #             "injection_prompt": config.injection_prompt,
-    #             "target_phrase": config.target_phrase,
-    #             "weight": config.weight,
-    #             "sigma_range": f"{config.sigma_start:.1f} - {config.sigma_end:.1f}",
-    #             "fuzzy_match": config.fuzzy_match
-    #         }
-    #         summaries.append(summary)
-    #     return summaries
-    
-    def apply_to_pipeline(self, pipeline: DiffusionPipeline) -> DiffusionPipeline:
-        """
-        Apply regional injections to pipeline.
-        
-        Args:
-            pipeline: Pipeline to modify
-            
-        Returns:
-            Modified pipeline
-        """
-        if not self.composition.layers:
-            # Fall back to regular injection if no composition layers
-            return super().apply_to_pipeline(pipeline)
-        
-        # Compile the final embedding from the composition
-        blended_embedding = self.composition.compile(pipeline)
-
-        # Apply the same blended embedding across all specified blocks for each layer
-        # Note: This implementation assumes you want the fully blended prompt
-        # applied at different stages (blocks). A more complex setup could
-        # compile different compositions for different blocks.
-        if hasattr(self, '_layer_blocks'):
-            for i, layer in enumerate(self.composition.layers):
-                block = self._layer_blocks[i]
-                
-                # Use the compiled embedding for all injections
-                # The spatial mask is handled during compilation.
-                # The weight and sigma from the layer are used for injection timing.
-                self.add_injection(
-                    block=block,
-                    prompt="",  # Prompt is pre-encoded
-                    weight=layer.weight,
-                    sigma_start=layer.sigma_start,
-                    sigma_end=layer.sigma_end,
-                    spatial_mask=None # Mask is already in the compiled embedding
-                )
-
-                # Set the encoded prompt for the corresponding config
-                if isinstance(block, str) and block.lower() == "all":
-                    all_blocks = self.patcher.block_mapper.get_all_block_identifiers()
-                    for block_id_str in all_blocks:
-                        block_id = BlockIdentifier.from_string(block_id_str)
-                        if block_id in self.configs:
-                            self.configs[block_id]._encoded_prompt = blended_embedding
-                else:
-                    block_id = BlockIdentifier.from_string(block) if isinstance(block, str) else block
-                    if block_id in self.configs:
-                        self.configs[block_id]._encoded_prompt = blended_embedding
-
-        return super().apply_to_pipeline(pipeline)
-    
-    def clear_injections(self):
-        """Clear all injections including regional ones."""
-        super().clear_injections()
-        self.composition.layers.clear()
-        if hasattr(self, '_layer_blocks'):
-            self._layer_blocks.clear()
 
 
 # Helper functions for creating common spatial regions

@@ -9,11 +9,8 @@ from .base import BasePromptInjector
 from .simple import SimplePromptInjector
 from .advanced import AdvancedPromptInjector
 from .masking import MaskedPromptInjector, TokenMask, TokenAnalyzer, MaskedPromptEncoder
-from .composition import (
-    RegionalComposition, CompositionLayer, BlendMode, MaskFactory
-)
 from .spatial import (
-    RegionalPromptInjector, CoordinateMapper,
+    RegionalPromptInjector,
     # Mask creation helpers
     create_rectangle_mask, create_circle_mask,
     # Quadrant masks
@@ -37,7 +34,6 @@ __all__ = [
     "TokenAnalyzer", 
     "MaskedPromptEncoder",
     "RegionalPromptInjector",
-    "CoordinateMapper",
     "RegionalComposition",
     "CompositionLayer",
     "BlendMode",
