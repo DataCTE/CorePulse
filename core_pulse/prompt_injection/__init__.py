@@ -25,6 +25,9 @@ from .spatial import (
     create_horizontal_strip_mask, create_vertical_strip_mask
 )
 from .attention import AttentionMapInjector
+from .self_attention import SelfAttentionInjector
+from .multi_scale import MultiScaleInjector
+from .unified import UnifiedAdvancedInjector
 
 __all__ = [
     "BasePromptInjector",
@@ -36,6 +39,9 @@ __all__ = [
     "MaskedPromptEncoder",
     "RegionalPromptInjector",
     "AttentionMapInjector",
+    "SelfAttentionInjector",
+    "MultiScaleInjector",
+    "UnifiedAdvancedInjector",
     "RegionalComposition",
     "CompositionLayer",
     "BlendMode",

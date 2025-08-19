@@ -160,11 +160,12 @@ class AdvancedPromptInjector(BasePromptInjector):
         Returns:
             Modified pipeline
         """
-        # Check if there are any prompt injections or attention map configs in the patcher
-        if not self.configs and not self.patcher.attention_map_configs:
+        # Check if there are any prompt injections, attention map configs, or self-attention configs in the patcher
+        if not self.configs and not self.patcher.attention_map_configs and not self.patcher.self_attention_configs:
             raise ValueError("No injections or attention manipulations configured. Add them first.")
         
-        logger.info(f"Encoding {len(self.configs)} prompts for injection.")
+        total_configs = len(self.configs) + len(self.patcher.attention_map_configs) + len(self.patcher.self_attention_configs)
+        logger.info(f"Applying {total_configs} configurations: {len(self.configs)} prompt injections, {len(self.patcher.attention_map_configs)} attention manipulations, {len(self.patcher.self_attention_configs)} self-attention manipulations.")
         # Encode all prompts and add to patcher
         for block_id, config in self.configs.items():
             try:

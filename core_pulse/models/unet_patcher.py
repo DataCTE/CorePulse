@@ -31,6 +31,7 @@ class UNetBlockMapper:
         """
         self.unet_config = unet.config
         self.blocks = self._build_block_map()
+        self.resolution_levels = self._build_resolution_map()
 
     def _build_block_map(self) -> Dict[str, List[int]]:
         """Build the block map from the UNet's configuration."""
@@ -52,6 +53,103 @@ class UNetBlockMapper:
                 
         return block_map
     
+    def _build_resolution_map(self) -> Dict[str, Dict[str, Union[int, str]]]:
+        """
+        Build a mapping of blocks to their resolution levels.
+        
+        Returns:
+            Dictionary mapping block identifiers to resolution info:
+            {
+                "input:0": {"level": 0, "resolution": "high"},
+                "input:1": {"level": 1, "resolution": "medium"},  
+                "middle:0": {"level": 3, "resolution": "lowest"},
+                "output:0": {"level": 2, "resolution": "low"},
+                ...
+            }
+        """
+        resolution_map = {}
+        
+        # Input blocks: start high resolution, go down (downsample)
+        input_blocks = self.blocks.get('input', [])
+        for i, block_idx in enumerate(input_blocks):
+            block_id = f"input:{block_idx}"
+            resolution_map[block_id] = {
+                "level": i,
+                "resolution": self._level_to_resolution_name(i),
+                "stage": "downsample"
+            }
+        
+        # Middle blocks: lowest resolution
+        middle_blocks = self.blocks.get('middle', [])
+        max_input_level = len(input_blocks)
+        for i, block_idx in enumerate(middle_blocks):
+            block_id = f"middle:{block_idx}"  
+            resolution_map[block_id] = {
+                "level": max_input_level + i,
+                "resolution": "lowest",
+                "stage": "bottleneck"
+            }
+        
+        # Output blocks: start low resolution, go up (upsample)
+        output_blocks = self.blocks.get('output', [])
+        max_middle_level = max_input_level + len(middle_blocks)
+        for i, block_idx in enumerate(output_blocks):
+            block_id = f"output:{block_idx}"
+            # Output blocks reverse the resolution order
+            reverse_level = max_middle_level - 1 - i
+            resolution_map[block_id] = {
+                "level": reverse_level,
+                "resolution": self._level_to_resolution_name(max(0, reverse_level - len(middle_blocks))),
+                "stage": "upsample"
+            }
+        
+        return resolution_map
+    
+    def _level_to_resolution_name(self, level: int) -> str:
+        """Convert numeric resolution level to descriptive name."""
+        if level == 0:
+            return "highest"
+        elif level == 1:
+            return "high" 
+        elif level == 2:
+            return "medium"
+        elif level == 3:
+            return "low"
+        else:
+            return "lowest"
+    
+    def get_blocks_by_resolution(self, resolution: str) -> List[str]:
+        """
+        Get all block identifiers at a specific resolution level.
+        
+        Args:
+            resolution: "highest", "high", "medium", "low", "lowest"
+            
+        Returns:
+            List of block identifiers at that resolution
+        """
+        matching_blocks = []
+        for block_id, info in self.resolution_levels.items():
+            if info["resolution"] == resolution:
+                matching_blocks.append(block_id)
+        return matching_blocks
+    
+    def get_blocks_by_stage(self, stage: str) -> List[str]:
+        """
+        Get all block identifiers at a specific processing stage.
+        
+        Args:
+            stage: "downsample", "bottleneck", "upsample"
+            
+        Returns:
+            List of block identifiers at that stage
+        """
+        matching_blocks = []
+        for block_id, info in self.resolution_levels.items():
+            if info["stage"] == stage:
+                matching_blocks.append(block_id)
+        return matching_blocks
+
     def get_valid_blocks(self) -> Dict[str, List[int]]:
         """Get all valid blocks for this model type."""
         return self.blocks.copy()
@@ -108,6 +206,17 @@ class AttentionMapConfig:
     sigma_end: float = 0.0
 
 
+@dataclass
+class SelfAttentionConfig:
+    """Configuration for self-attention manipulation (image -> image attention)."""
+    source_region: Optional[torch.Tensor] = None  # Which pixels to modify attention FROM
+    target_region: Optional[torch.Tensor] = None  # Which pixels to modify attention TO  
+    attention_scale: float = 1.0  # How much to amplify/reduce attention
+    interaction_type: str = "enhance"  # "enhance", "suppress", "redirect"
+    sigma_start: float = 14.0
+    sigma_end: float = 0.0
+
+
 class PromptInjectionProcessor:
     """
     Custom attention processor for injecting prompts at specific blocks.
@@ -120,7 +229,9 @@ class PromptInjectionProcessor:
     def __init__(self, original_processor, block_id: str, conditioning: Optional[torch.Tensor] = None, 
                  weight: float = 1.0, sigma_start: float = 0.0, sigma_end: float = 1.0,
                  spatial_mask: Optional[torch.Tensor] = None,
-                 attention_maps: Optional[List[AttentionMapConfig]] = None):
+                 attention_maps: Optional[List[AttentionMapConfig]] = None,
+                 self_attention_configs: Optional[List[SelfAttentionConfig]] = None,
+                 module_path: Optional[str] = None):
         self.original_processor = original_processor
         self.block_id = block_id  # e.g., "middle:0", "output:1"
         self.conditioning = conditioning
@@ -129,7 +240,12 @@ class PromptInjectionProcessor:
         self.sigma_end = sigma_end      # Lower values (less noise)
         self.spatial_mask = spatial_mask  # Optional spatial mask for regional control
         self.attention_maps = attention_maps or []
+        self.self_attention_configs = self_attention_configs or []
         self.projection_layer = None # For handling mismatched dimensions
+        self.module_path = module_path or ""  # Full path to the module (for debugging)
+        
+        # Determine if this is self-attention based on module path
+        self.is_self_attention_module = "attn1" in self.module_path if self.module_path else False
         
         # Parse block info
         if ':' in block_id:
@@ -228,7 +344,7 @@ class PromptInjectionProcessor:
             attention_scores = torch.bmm(query, key.transpose(-1, -2))
             attention_scores = attention_scores * attn.scale
             
-            # --- ATTENTION MAP MANIPULATION ---
+            # --- ATTENTION MAP MANIPULATION (Cross-Attention) ---
             current_sigma = getattr(self, '_current_sigma', None)
             for attn_map in self.attention_maps:
                 if current_sigma is None or (current_sigma <= attn_map.sigma_start and current_sigma >= attn_map.sigma_end):
@@ -264,6 +380,36 @@ class PromptInjectionProcessor:
                     
                     # Log stats after manipulation
                     logger.debug(f"  - Attn scores AFTER:  mean={attention_scores.mean().item():.4f}, max={attention_scores.max().item():.4f}, std={attention_scores.std().item():.4f}")
+            
+            # --- SELF-ATTENTION MANIPULATION (Image -> Image) ---
+            # Use module path to determine if this is self-attention
+            if self.is_self_attention_module and len(self.self_attention_configs) > 0:
+                logger.warning(f"[{self.block_id}] SELF-ATTENTION MODULE ({self.module_path}): hidden={hidden_states.shape}, encoder={encoder_hidden_states.shape if encoder_hidden_states is not None else None}")
+                for i, self_attn_config in enumerate(self.self_attention_configs):
+                    if current_sigma is None or (current_sigma <= self_attn_config.sigma_start and current_sigma >= self_attn_config.sigma_end):
+                        logger.warning(f"[{self.block_id}] APPLYING SELF-ATTENTION {i}: {self_attn_config.interaction_type} with scale {self_attn_config.attention_scale}")
+                        
+                        # Store original for comparison
+                        orig_mean = attention_scores.mean().item()
+                        orig_std = attention_scores.std().item()
+                        
+                        # Apply self-attention manipulation based on interaction type
+                        attention_scores = self._apply_self_attention_manipulation(
+                            attention_scores, self_attn_config
+                        )
+                        
+                        # Log the change
+                        new_mean = attention_scores.mean().item()
+                        new_std = attention_scores.std().item()
+                        logger.warning(f"[{self.block_id}] SELF-ATTENTION CHANGED: {orig_mean:.4f}->{new_mean:.4f} mean, {orig_std:.4f}->{new_std:.4f} std")
+                    else:
+                        logger.info(f"[{self.block_id}] Skipping self-attention {i}: sigma {current_sigma} not in range [{self_attn_config.sigma_start}, {self_attn_config.sigma_end}]")
+            else:
+                # This is cross-attention or self-attention without configs
+                if self.is_self_attention_module:
+                    logger.debug(f"[{self.block_id}] SELF-ATTENTION module ({self.module_path}) but no configs")
+                else:
+                    logger.debug(f"[{self.block_id}] CROSS-ATTENTION module ({self.module_path})")
             # --- END MANIPULATION ---
 
             attention_probs = attention_scores.softmax(dim=-1)
@@ -405,6 +551,109 @@ class PromptInjectionProcessor:
             # Fallback to the injected (but not masked) output
             return attention_output
     
+    def _apply_self_attention_manipulation(self, attention_scores: torch.Tensor, 
+                                         config: SelfAttentionConfig) -> torch.Tensor:
+        """
+        Apply self-attention manipulation to attention scores.
+        
+        Args:
+            attention_scores: Attention scores tensor (batch_heads, height*width, height*width)
+            config: Self-attention configuration
+            
+        Returns:
+            Modified attention scores
+        """
+        try:
+            batch_heads, seq_len, seq_len_2 = attention_scores.shape
+            assert seq_len == seq_len_2, "Self-attention should have square attention matrix"
+            
+            # If we have spatial regions defined, apply region-based manipulation
+            if config.source_region is not None or config.target_region is not None:
+                # Prepare spatial masks
+                source_mask = config.source_region
+                target_mask = config.target_region
+                
+                if source_mask is not None:
+                    # Flatten spatial mask to match sequence length
+                    if source_mask.numel() != seq_len:
+                        # Resize mask to match attention resolution
+                        spatial_size = int(seq_len ** 0.5)  # Assume square spatial arrangement
+                        source_mask = torch.nn.functional.interpolate(
+                            source_mask.unsqueeze(0).unsqueeze(0).float(),
+                            size=(spatial_size, spatial_size),
+                            mode='bilinear',
+                            align_corners=False
+                        ).squeeze().flatten()
+                    source_mask = source_mask.to(attention_scores.device)
+                
+                if target_mask is not None:
+                    if target_mask.numel() != seq_len:
+                        spatial_size = int(seq_len ** 0.5)
+                        target_mask = torch.nn.functional.interpolate(
+                            target_mask.unsqueeze(0).unsqueeze(0).float(),
+                            size=(spatial_size, spatial_size),
+                            mode='bilinear',
+                            align_corners=False
+                        ).squeeze().flatten()
+                    target_mask = target_mask.to(attention_scores.device)
+                
+                # Apply manipulation based on interaction type
+                if config.interaction_type == "enhance":
+                    # Enhance attention between specified regions
+                    if source_mask is not None and target_mask is not None:
+                        # Source pixels attend more to target pixels
+                        source_indices = torch.nonzero(source_mask > 0.5, as_tuple=True)[0]
+                        target_indices = torch.nonzero(target_mask > 0.5, as_tuple=True)[0]
+                        
+                        if len(source_indices) > 0 and len(target_indices) > 0:
+                            attention_scores[:, source_indices[:, None], target_indices] *= config.attention_scale
+                
+                elif config.interaction_type == "suppress":
+                    # Suppress attention between specified regions
+                    if source_mask is not None and target_mask is not None:
+                        source_indices = torch.nonzero(source_mask > 0.5, as_tuple=True)[0]
+                        target_indices = torch.nonzero(target_mask > 0.5, as_tuple=True)[0]
+                        
+                        if len(source_indices) > 0 and len(target_indices) > 0:
+                            attention_scores[:, source_indices[:, None], target_indices] *= config.attention_scale
+                
+                elif config.interaction_type == "redirect":
+                    # Redirect attention from one region to another
+                    if source_mask is not None and target_mask is not None:
+                        source_indices = torch.nonzero(source_mask > 0.5, as_tuple=True)[0]
+                        target_indices = torch.nonzero(target_mask > 0.5, as_tuple=True)[0]
+                        
+                        if len(source_indices) > 0 and len(target_indices) > 0:
+                            # Reduce attention to non-target regions from source
+                            for s_idx in source_indices:
+                                attention_scores[:, s_idx] *= 0.5  # Reduce overall attention
+                                # Boost attention to target region
+                                attention_scores[:, s_idx, target_indices] *= config.attention_scale * 2.0
+            
+            else:
+                # Global self-attention manipulation
+                logger.debug(f"Applying global {config.interaction_type} with scale {config.attention_scale}")
+                if config.interaction_type == "enhance":
+                    # Enhance global coherence by amplifying all self-attention scores
+                    attention_scores = attention_scores * config.attention_scale
+                elif config.interaction_type == "suppress":
+                    # Suppress global coherence by reducing all self-attention scores
+                    attention_scores = attention_scores * config.attention_scale  # Scale should be < 1.0 for suppression
+                elif config.interaction_type == "sharpen":
+                    # Sharpen attention patterns by raising to a power
+                    attention_scores = torch.pow(torch.clamp(attention_scores, min=1e-8), config.attention_scale)
+                elif config.interaction_type == "smooth":
+                    # Smooth attention patterns by adding uniform noise
+                    uniform_attention = torch.ones_like(attention_scores) / seq_len
+                    attention_scores = (1.0 - config.attention_scale) * attention_scores + config.attention_scale * uniform_attention
+                
+            return attention_scores
+            
+        except Exception as e:
+            logger.error(f"Error in self-attention manipulation: {e}", exc_info=True)
+            # Return original scores on error
+            return attention_scores
+
     def set_current_sigma(self, sigma: float):
         """Set current sigma for injection timing control."""
         self._current_sigma = sigma
@@ -472,6 +721,7 @@ class UNetPatcher(BaseModelPatcher):
         self.block_mapper = UNetBlockMapper(unet)
         self.injection_configs: Dict[str, Dict[str, Any]] = {}
         self.attention_map_configs: Dict[str, List[AttentionMapConfig]] = {}
+        self.self_attention_configs: Dict[str, List[SelfAttentionConfig]] = {}
         self._original_processors: Dict[str, Any] = {}
         self._injection_processors: Dict[str, PromptInjectionProcessor] = {}
         self._sigma_hook = UNetSigmaHook(self, scheduler)
@@ -561,10 +811,54 @@ class UNetPatcher(BaseModelPatcher):
                 self.attention_map_configs[block_id] = []
             self.attention_map_configs[block_id].append(config)
 
+    def add_self_attention_manipulation(self, block: Union[str, BlockIdentifier],
+                                      source_region: Optional[torch.Tensor] = None,
+                                      target_region: Optional[torch.Tensor] = None,
+                                      attention_scale: float = 1.0,
+                                      interaction_type: str = "enhance",
+                                      sigma_start: float = 1.0,
+                                      sigma_end: float = 0.0):
+        """
+        Add self-attention manipulation for controlling image-to-image attention.
+        
+        Args:
+            block: Block identifier or "all"
+            source_region: Spatial mask for pixels whose attention to modify (FROM)
+            target_region: Spatial mask for pixels to attend to (TO)
+            attention_scale: Scaling factor for attention weights
+            interaction_type: "enhance", "suppress", or "redirect"
+            sigma_start: Start sigma for manipulation window
+            sigma_end: End sigma for manipulation window
+        """
+        config = SelfAttentionConfig(
+            source_region=source_region,
+            target_region=target_region,
+            attention_scale=attention_scale,
+            interaction_type=interaction_type,
+            sigma_start=sigma_start,
+            sigma_end=sigma_end
+        )
+
+        if isinstance(block, str) and block.lower() == "all":
+            all_blocks = self.block_mapper.get_all_block_identifiers()
+            for block_id in all_blocks:
+                if block_id not in self.self_attention_configs:
+                    self.self_attention_configs[block_id] = []
+                self.self_attention_configs[block_id].append(config)
+        else:
+            block_id = str(block) if isinstance(block, BlockIdentifier) else block
+            if not self.block_mapper.is_valid_block(BlockIdentifier.from_string(block_id)):
+                raise ValueError(f"Invalid block: {block_id}")
+            
+            if block_id not in self.self_attention_configs:
+                self.self_attention_configs[block_id] = []
+            self.self_attention_configs[block_id].append(config)
+
     def clear_injections(self):
         """Clear all prompt injections."""
         self.injection_configs.clear()
         self.attention_map_configs.clear()
+        self.self_attention_configs.clear()
         self._injection_processors.clear()
     
     def apply_patches(self, unet: UNet2DConditionModel) -> UNet2DConditionModel:
@@ -577,7 +871,7 @@ class UNetPatcher(BaseModelPatcher):
         Returns:
             Patched UNet model
         """
-        if not self.injection_configs and not self.attention_map_configs:
+        if not self.injection_configs and not self.attention_map_configs and not self.self_attention_configs:
             return unet
         
         # Store original processors for restoration
@@ -588,7 +882,7 @@ class UNetPatcher(BaseModelPatcher):
         if self._hook_handle is None:
             self._hook_handle = unet.register_forward_pre_hook(self._sigma_hook, with_kwargs=False)
         
-        all_block_ids = set(self.injection_configs.keys()) | set(self.attention_map_configs.keys())
+        all_block_ids = set(self.injection_configs.keys()) | set(self.attention_map_configs.keys()) | set(self.self_attention_configs.keys())
         
         for block_id in all_block_ids:
             try:
@@ -597,35 +891,70 @@ class UNetPatcher(BaseModelPatcher):
                 block = config['block']
                 diffusers_path = self.block_mapper.map_to_diffusers_path(block)
                 
-                # Find cross-attention modules in this block
-                attention_modules = self._find_cross_attention_modules(unet, diffusers_path)
+                # Get configs for this specific block
+                inj_config = self.injection_configs.get(block_id)
+                attn_maps = self.attention_map_configs.get(block_id)
+                self_attn_configs = self.self_attention_configs.get(block_id)
                 
-                for module_path, attn_module in attention_modules:
-                    # Store original processor
-                    original_processor = getattr(attn_module, 'processor', AttnProcessor2_0())
-                    self._original_processors[module_path] = original_processor
+                # Find cross-attention modules if we have cross-attention configs
+                if inj_config or attn_maps:
+                    attention_modules = self._find_cross_attention_modules(unet, diffusers_path)
                     
-                    # Get configs for this specific block
-                    inj_config = self.injection_configs.get(block_id)
-                    attn_maps = self.attention_map_configs.get(block_id)
+                    for module_path, attn_module in attention_modules:
+                        # Store original processor
+                        original_processor = getattr(attn_module, 'processor', AttnProcessor2_0())
+                        self._original_processors[module_path] = original_processor
+                        
+                        # Create custom processor for cross-attention
+                        custom_processor = PromptInjectionProcessor(
+                            original_processor=original_processor,
+                            block_id=block_id,
+                            conditioning=inj_config.get('conditioning') if inj_config else None,
+                            weight=inj_config.get('weight', 1.0) if inj_config else 1.0,
+                            sigma_start=inj_config.get('sigma_start', 0.0) if inj_config else 0.0,
+                            sigma_end=inj_config.get('sigma_end', 1.0) if inj_config else 1.0,
+                            spatial_mask=inj_config.get('spatial_mask') if inj_config else None,
+                            attention_maps=attn_maps,
+                            module_path=module_path
+                        )
+                        
+                        # Store processor for sigma updates
+                        self._injection_processors[module_path] = custom_processor
+                        
+                        # Set the custom processor
+                        attn_module.set_processor(custom_processor)
+                
+                # Find self-attention modules if we have self-attention configs
+                if self_attn_configs:
+                    self_attention_modules = self._find_self_attention_modules(unet, diffusers_path)
+                    logger.warning(f"BLOCK {block_id}: Found {len(self_attention_modules)} self-attention modules at {diffusers_path}")
+                    for path, _ in self_attention_modules:
+                        logger.warning(f"  - Self-attention module: {path}")
                     
-                    # Create custom processor
-                    custom_processor = PromptInjectionProcessor(
-                        original_processor=original_processor,
-                        block_id=block_id,
-                        conditioning=inj_config.get('conditioning') if inj_config else None,
-                        weight=inj_config.get('weight', 1.0) if inj_config else 1.0,
-                        sigma_start=inj_config.get('sigma_start', 0.0) if inj_config else 0.0,
-                        sigma_end=inj_config.get('sigma_end', 1.0) if inj_config else 1.0,
-                        spatial_mask=inj_config.get('spatial_mask') if inj_config else None,
-                        attention_maps=attn_maps
-                    )
-                    
-                    # Store processor for sigma updates
-                    self._injection_processors[module_path] = custom_processor
-                    
-                    # Set the custom processor
-                    attn_module.set_processor(custom_processor)
+                    for module_path, attn_module in self_attention_modules:
+                        # Store original processor
+                        original_processor = getattr(attn_module, 'processor', AttnProcessor2_0())
+                        self._original_processors[module_path] = original_processor
+                        
+                        # Create custom processor for self-attention
+                        custom_processor = PromptInjectionProcessor(
+                            original_processor=original_processor,
+                            block_id=block_id,
+                            conditioning=None,  # No conditioning for self-attention
+                            weight=1.0,
+                            sigma_start=0.0,
+                            sigma_end=1.0,
+                            spatial_mask=None,
+                            attention_maps=[],  # No token-level attention for self-attention
+                            self_attention_configs=self_attn_configs,
+                            module_path=module_path
+                        )
+                        
+                        # Store processor for sigma updates
+                        self._injection_processors[module_path] = custom_processor
+                        
+                        # Set the custom processor
+                        attn_module.set_processor(custom_processor)
                         
             except Exception as e:
                 print(f"Warning: Failed to patch block {block_id}: {e}")
@@ -698,10 +1027,17 @@ class UNetPatcher(BaseModelPatcher):
             
         return attention_modules
     
-    def _collect_cross_attention_modules(self, module, path: str, 
-                                       results: List[Tuple[str, Attention]]):
+    def _collect_attention_modules(self, module, path: str, 
+                                   results: List[Tuple[str, Attention]], 
+                                   attention_type: str = "cross"):
         """
-        Recursively collect cross-attention modules from a block.
+        Recursively collect attention modules from a block.
+        
+        Args:
+            module: Module to search
+            path: Current path in the module hierarchy
+            results: List to append found modules
+            attention_type: "cross" for attn2, "self" for attn1, "both" for both
         """
         # Some modules might not have children (e.g., final layers)
         if not hasattr(module, 'named_children'):
@@ -710,17 +1046,66 @@ class UNetPatcher(BaseModelPatcher):
         for name, child in module.named_children():
             child_path = f"{path}.{name}"
             
-            # Check if this is a cross-attention module
-            # In diffusers, cross-attention is usually named 'attn2'
-            if hasattr(child, 'processor') and name == 'attn2':
+            # Check attention type and collect accordingly
+            if hasattr(child, 'processor'):
+                should_collect = False
                 
-                results.append((child_path, child))
-            elif hasattr(child, 'processor') and 'cross' in name.lower():
-               
-                results.append((child_path, child))
+                if attention_type in ["cross", "both"] and name == 'attn2':
+                    # Cross-attention (text -> image)
+                    should_collect = True
+                elif attention_type in ["cross", "both"] and 'cross' in name.lower():
+                    # Alternative cross-attention naming
+                    should_collect = True
+                elif attention_type in ["self", "both"] and name == 'attn1':
+                    # Self-attention (image -> image)
+                    should_collect = True
+                elif attention_type in ["self", "both"] and 'self' in name.lower():
+                    # Alternative self-attention naming
+                    should_collect = True
+                
+                if should_collect:
+                    results.append((child_path, child))
             else:
                 # Recurse into child modules
-                self._collect_cross_attention_modules(child, child_path, results)
+                self._collect_attention_modules(child, child_path, results, attention_type)
+    
+    def _collect_cross_attention_modules(self, module, path: str, 
+                                       results: List[Tuple[str, Attention]]):
+        """
+        Recursively collect cross-attention modules from a block.
+        """
+        return self._collect_attention_modules(module, path, results, "cross")
+    
+    def _find_self_attention_modules(self, unet: UNet2DConditionModel, 
+                                   diffusers_path: str) -> List[Tuple[str, Attention]]:
+        """
+        Find self-attention modules to patch in a specific block.
+        
+        Args:
+            unet: UNet model to search
+            diffusers_path: Diffusers path to the block (e.g., "down_blocks.0")
+            
+        Returns:
+            List of (module_path, attention_module) tuples
+        """
+        attention_modules = []
+        
+        try:
+            # Navigate to the target block
+            target_module = unet
+            for attr in diffusers_path.split('.'):
+                if attr.isdigit():
+                    target_module = target_module[int(attr)]
+                else:
+                    target_module = getattr(target_module, attr)
+            
+            # Recursively find self-attention modules
+            self._collect_attention_modules(target_module, diffusers_path, attention_modules, "self")
+            
+        except Exception as e:
+            print(f"Warning: Could not access {diffusers_path} for self-attention: {e}")
+            
+        return attention_modules
     
     def set_current_sigma(self, sigma: float):
         """
