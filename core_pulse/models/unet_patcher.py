@@ -79,18 +79,23 @@ class UNetBlockMapper:
         Returns:
             String path to the module in diffusers UNet
         """
-        if not self.is_valid_block(block):
-            raise ValueError(f"Invalid block for {self.unet_config.model_type}: {block}")
-        
-        if block.block_type == "input":
-            return f"down_blocks.{block.block_index}"
-        elif block.block_type == "middle": 
-            # Middle block is just "mid_block", not indexed
-            return "mid_block"
-        elif block.block_type == "output":
-            return f"up_blocks.{block.block_index}"
-        else:
-            raise ValueError(f"Unknown block type: {block.block_type}")
+        try:
+            if not self.is_valid_block(block):
+                model_name = self.unet_config.get("model_type", "unknown")
+                raise ValueError(f"Invalid block for {model_name}: {block}")
+            
+            if block.block_type == "input":
+                return f"down_blocks.{block.block_index}"
+            elif block.block_type == "middle": 
+                # Middle block is just "mid_block", not indexed
+                return "mid_block"
+            elif block.block_type == "output":
+                return f"up_blocks.{block.block_index}"
+            else:
+                raise ValueError(f"Unknown block type: {block.block_type}")
+        except ValueError as e:
+            logger.error(f"Failed to map block {block}: {e}", exc_info=True)
+            raise
 
 
 @dataclass
@@ -140,42 +145,52 @@ class PromptInjectionProcessor:
                  timestep: Optional[int] = None,
                  **kwargs) -> torch.Tensor:
         
-        
-        # Get current sigma from timestep if available
-        current_sigma = getattr(self, '_current_sigma', None)
-        
-        # Check if we should inject at this timestep/sigma
-        should_inject = self._should_inject(current_sigma)
-        
-        if (should_inject and 
-            encoder_hidden_states is not None and 
-            self.conditioning is not None):
+        try:
+            # Get current sigma from timestep if available
+            current_sigma = getattr(self, '_current_sigma', None)
             
+            # Check if we should inject at this timestep/sigma
+            should_inject = self._should_inject(current_sigma)
             
-            if self.spatial_mask is not None:
-                # Spatial injection: apply injection and then blend spatially
-                original_shape = encoder_hidden_states.shape
-                injected_states = self._apply_injection(encoder_hidden_states)
+            if (should_inject and 
+                encoder_hidden_states is not None and 
+                self.conditioning is not None):
                 
-                # Run attention with injected conditioning
-                attention_output = self._compute_attention(
-                    attn, hidden_states, injected_states, attention_mask, **kwargs
-                )
                 
-                # Apply spatial masking to blend injection and original
-                return self._apply_spatial_masking(
-                    attention_output, hidden_states, attn, encoder_hidden_states,
-                    attention_mask, timestep, **kwargs
+                if self.spatial_mask is not None:
+                    # Spatial injection: apply injection and then blend spatially
+                    original_shape = encoder_hidden_states.shape
+                    injected_states = self._apply_injection(encoder_hidden_states)
+                    
+                    # Run attention with injected conditioning
+                    attention_output = self._compute_attention(
+                        attn, hidden_states, injected_states, attention_mask, **kwargs
+                    )
+                    
+                    # Apply spatial masking to blend injection and original
+                    return self._apply_spatial_masking(
+                        attention_output, hidden_states, attn, encoder_hidden_states,
+                        attention_mask, timestep, **kwargs
+                    )
+                else:
+                    # Non-spatial injection: standard approach
+                    original_shape = encoder_hidden_states.shape
+                    encoder_hidden_states = self._apply_injection(encoder_hidden_states)
+
+            # Standard attention computation (or with injected states)
+            return self._compute_attention(
+                attn, hidden_states, encoder_hidden_states, attention_mask, **kwargs
+            )
+        except Exception as e:
+            logger.error(f"Error in PromptInjectionProcessor for block {self.block_id}: {e}", exc_info=True)
+            # Fallback to original processor to prevent crashing the whole generation
+            if hasattr(self.original_processor, '__call__'):
+                return self.original_processor(
+                    attn, hidden_states, encoder_hidden_states, attention_mask=attention_mask, **kwargs
                 )
             else:
-                # Non-spatial injection: standard approach
-                original_shape = encoder_hidden_states.shape
-                encoder_hidden_states = self._apply_injection(encoder_hidden_states)
-
-        # Standard attention computation (or with injected states)
-        return self._compute_attention(
-            attn, hidden_states, encoder_hidden_states, attention_mask, **kwargs
-        )
+                # If original processor is not callable, re-raise the exception
+                raise
     
     def _compute_attention(self, attn: Attention, hidden_states: torch.Tensor,
                            encoder_hidden_states: Optional[torch.Tensor] = None,
@@ -185,87 +200,96 @@ class PromptInjectionProcessor:
         Replicates the logic of AttnProcessor2_0 to allow for attention score manipulation.
         """
         residual = hidden_states
-        input_ndim = hidden_states.ndim
-        
-        if input_ndim == 4:
-            batch_size, channel, height, width = hidden_states.shape
-            hidden_states = hidden_states.view(batch_size, channel, height * width).transpose(1, 2)
-        
-        batch_size, sequence_length, _ = (
-            hidden_states.shape if encoder_hidden_states is None else encoder_hidden_states.shape
-        )
-        
-        attention_mask = attn.prepare_attention_mask(attention_mask, sequence_length, batch_size)
-        
-        query = attn.to_q(hidden_states)
-        
-        if encoder_hidden_states is None:
-            encoder_hidden_states = hidden_states
-        
-        key = attn.to_k(encoder_hidden_states)
-        value = attn.to_v(encoder_hidden_states)
-        
-        query = attn.head_to_batch_dim(query)
-        key = attn.head_to_batch_dim(key)
-        value = attn.head_to_batch_dim(value)
-        
-        attention_probs = attn.get_attention_scores(query, key, attention_mask)
-        
-        # --- ATTENTION MAP MANIPULATION ---
-        current_sigma = getattr(self, '_current_sigma', None)
-        for attn_map in self.attention_maps:
-            if current_sigma is None or (current_sigma <= attn_map.sigma_start and current_sigma >= attn_map.sigma_end):
-                
-                # Filter indices to prevent out-of-bounds errors
-                max_token_idx = attention_probs.shape[-1]
-                valid_indices = [idx for idx in attn_map.target_token_indices if idx < max_token_idx]
-                
-                if not valid_indices:
-                    continue
+        try:
+            input_ndim = hidden_states.ndim
+            
+            if input_ndim == 4:
+                batch_size, channel, height, width = hidden_states.shape
+                hidden_states = hidden_states.view(batch_size, channel, height * width).transpose(1, 2)
+            
+            batch_size, sequence_length, _ = (
+                hidden_states.shape if encoder_hidden_states is None else encoder_hidden_states.shape
+            )
+            
+            attention_mask = attn.prepare_attention_mask(attention_mask, sequence_length, batch_size)
+            
+            query = attn.to_q(hidden_states)
+            
+            if encoder_hidden_states is None:
+                encoder_hidden_states = hidden_states
+            
+            key = attn.to_k(encoder_hidden_states)
+            value = attn.to_v(encoder_hidden_states)
+            
+            query = attn.head_to_batch_dim(query)
+            key = attn.head_to_batch_dim(key)
+            value = attn.head_to_batch_dim(value)
+            
+            attention_scores = torch.bmm(query, key.transpose(-1, -2))
+            attention_scores = attention_scores * attn.scale
+            
+            # --- ATTENTION MAP MANIPULATION ---
+            current_sigma = getattr(self, '_current_sigma', None)
+            for attn_map in self.attention_maps:
+                if current_sigma is None or (current_sigma <= attn_map.sigma_start and current_sigma >= attn_map.sigma_end):
+                    
+                    # Filter indices to prevent out-of-bounds errors
+                    max_token_idx = attention_scores.shape[-1]
+                    valid_indices = [idx for idx in attn_map.target_token_indices if idx < max_token_idx]
+                    
+                    if not valid_indices:
+                        continue
 
-                logger.debug(f"[{self.block_id}] Applying attention map scale {attn_map.attention_scale} to tokens {valid_indices}")
-                
-                # Log stats before manipulation
-                logger.debug(f"  - Attn scores BEFORE: mean={attention_probs.mean().item():.4f}, max={attention_probs.max().item():.4f}")
+                    logger.debug(f"[{self.block_id}] Applying attention map scale {attn_map.attention_scale} to tokens {valid_indices}")
+                    
+                    # Log stats before manipulation
+                    logger.debug(f"  - Attn scores BEFORE: mean={attention_scores.mean().item():.4f}, max={attention_scores.max().item():.4f}, std={attention_scores.std().item():.4f}")
 
-                # Apply scaling to the specified token indices
-                # Shape of attention_probs: (batch_size * num_heads, pixel_patches, text_tokens)
-                scale_tensor = torch.ones_like(attention_probs)
-                
-                # Prepare spatial mask if it exists
-                if attn_map.spatial_mask is not None:
-                    spatial_mask = attn_map.spatial_mask.to(device=scale_tensor.device, dtype=scale_tensor.dtype)
-                    # Reshape mask to match (1, pixel_patches, 1) for broadcasting
-                    spatial_mask = spatial_mask.unsqueeze(0).unsqueeze(-1) 
-                    # Apply scale only where mask is > 0
-                    scale_factor = torch.where(spatial_mask > 0, attn_map.attention_scale, 1.0)
-                else:
+                    # Apply scaling to the specified token indices
+                    # Shape of attention_probs: (batch_size * num_heads, pixel_patches, text_tokens)
+                    scale_tensor = torch.ones_like(attention_scores)
+                    
+                    # Temporarily disable spatial mask for debugging
+                    # if attn_map.spatial_mask is not None:
+                    #     spatial_mask = attn_map.spatial_mask.to(device=scale_tensor.device, dtype=scale_tensor.dtype)
+                    #     # Reshape mask to match (1, pixel_patches, 1) for broadcasting
+                    #     spatial_mask = spatial_mask.unsqueeze(0).unsqueeze(-1) 
+                    #     # Apply scale only where mask is > 0
+                    #     scale_factor = torch.where(spatial_mask > 0, attn_map.attention_scale, 1.0)
+                    # else:
                     scale_factor = attn_map.attention_scale
 
-                scale_tensor[:, :, valid_indices] *= scale_factor
-                attention_probs = attention_probs * scale_tensor
-                
-                # Log stats after manipulation
-                logger.debug(f"  - Attn scores AFTER:  mean={attention_probs.mean().item():.4f}, max={attention_probs.max().item():.4f}")
-        # --- END MANIPULATION ---
+                    scale_tensor[:, :, valid_indices] *= scale_factor
+                    attention_scores = attention_scores * scale_tensor
+                    
+                    # Log stats after manipulation
+                    logger.debug(f"  - Attn scores AFTER:  mean={attention_scores.mean().item():.4f}, max={attention_scores.max().item():.4f}, std={attention_scores.std().item():.4f}")
+            # --- END MANIPULATION ---
 
-        hidden_states = torch.bmm(attention_probs, value)
-        hidden_states = attn.batch_to_head_dim(hidden_states)
-        
-        # linear proj
-        hidden_states = attn.to_out[0](hidden_states)
-        # dropout
-        hidden_states = attn.to_out[1](hidden_states)
-        
-        if input_ndim == 4:
-            hidden_states = hidden_states.transpose(-1, -2).reshape(batch_size, channel, height, width)
+            attention_probs = attention_scores.softmax(dim=-1)
+            logger.debug(f"  - Attn probs AFTER SOFTMAX: mean={attention_probs.mean().item():.4f}, max={attention_probs.max().item():.4f}, std={attention_probs.std().item():.4f}")
+            
+            hidden_states = torch.bmm(attention_probs, value)
+            hidden_states = attn.batch_to_head_dim(hidden_states)
+            
+            # linear proj
+            hidden_states = attn.to_out[0](hidden_states)
+            # dropout
+            hidden_states = attn.to_out[1](hidden_states)
+            
+            if input_ndim == 4:
+                hidden_states = hidden_states.transpose(-1, -2).reshape(batch_size, channel, height, width)
 
-        if attn.residual_connection:
-            hidden_states = hidden_states + residual
+            if attn.residual_connection:
+                hidden_states = hidden_states + residual
 
-        hidden_states = hidden_states / attn.rescale_output_factor
-        
-        return hidden_states
+            hidden_states = hidden_states / attn.rescale_output_factor
+            
+            return hidden_states
+        except Exception as e:
+            logger.error(f"Error during attention computation for block {self.block_id}: {e}", exc_info=True)
+            # Fallback to residual to prevent crashing
+            return residual
 
     def _should_inject(self, current_sigma: Optional[float]) -> bool:
         """Check if we should inject based on current sigma."""
@@ -279,46 +303,51 @@ class PromptInjectionProcessor:
     
     def _apply_injection(self, encoder_hidden_states: torch.Tensor) -> torch.Tensor:
         """Apply the conditioning injection (for text embeddings only)."""
-        batch_size = encoder_hidden_states.shape[0]
-        
-        # Ensure conditioning matches the required shape
-        if self.conditioning.shape[0] == 1 and batch_size > 1:
-            injected_conditioning = self.conditioning.repeat(batch_size, 1, 1)
-        else:
-            injected_conditioning = self.conditioning[:batch_size]
-        
-        # Move to same device and dtype
-        injected_conditioning = injected_conditioning.to(
-            device=encoder_hidden_states.device, 
-            dtype=encoder_hidden_states.dtype
-        )
-        
-        # Apply injection with ComfyUI's approach
-        if batch_size == 2:
-            # Replace only the conditional part (batch 1), keep unconditional (batch 0) 
-            result = encoder_hidden_states.clone()
-            # Ensure injected conditioning matches the shape of the target
-            if injected_conditioning.shape[-1] != result.shape[-1]:
-                if self.projection_layer is None:
-                    source_dim = injected_conditioning.shape[-1]
-                    target_dim = result.shape[-1]
-                    self.projection_layer = torch.nn.Linear(source_dim, target_dim)
-                    self.projection_layer.to(device=result.device, dtype=result.dtype)
-                injected_conditioning = self.projection_layer(injected_conditioning)
+        try:
+            batch_size = encoder_hidden_states.shape[0]
+            
+            # Ensure conditioning matches the required shape
+            if self.conditioning.shape[0] == 1 and batch_size > 1:
+                injected_conditioning = self.conditioning.repeat(batch_size, 1, 1)
+            else:
+                injected_conditioning = self.conditioning[:batch_size]
+            
+            # Move to same device and dtype
+            injected_conditioning = injected_conditioning.to(
+                device=encoder_hidden_states.device, 
+                dtype=encoder_hidden_states.dtype
+            )
+            
+            # Apply injection with ComfyUI's approach
+            if batch_size == 2:
+                # Replace only the conditional part (batch 1), keep unconditional (batch 0) 
+                result = encoder_hidden_states.clone()
+                # Ensure injected conditioning matches the shape of the target
+                if injected_conditioning.shape[-1] != result.shape[-1]:
+                    if self.projection_layer is None:
+                        source_dim = injected_conditioning.shape[-1]
+                        target_dim = result.shape[-1]
+                        self.projection_layer = torch.nn.Linear(source_dim, target_dim)
+                        self.projection_layer.to(device=result.device, dtype=result.dtype)
+                    injected_conditioning = self.projection_layer(injected_conditioning)
 
-            result[1] = injected_conditioning[0] * torch.tensor(self.weight, device=injected_conditioning.device, dtype=injected_conditioning.dtype)
-        else:
-            # Single batch: full replacement
-            if injected_conditioning.shape[-1] != encoder_hidden_states.shape[-1]:
-                if self.projection_layer is None:
-                    source_dim = injected_conditioning.shape[-1]
-                    target_dim = encoder_hidden_states.shape[-1]
-                    self.projection_layer = torch.nn.Linear(source_dim, target_dim)
-                    self.projection_layer.to(device=encoder_hidden_states.device, dtype=encoder_hidden_states.dtype)
-                injected_conditioning = self.projection_layer(injected_conditioning)
-            result = injected_conditioning * torch.tensor(self.weight, device=injected_conditioning.device, dtype=injected_conditioning.dtype)
-        
-        return result
+                result[1] = injected_conditioning[0] * torch.tensor(self.weight, device=injected_conditioning.device, dtype=injected_conditioning.dtype)
+            else:
+                # Single batch: full replacement
+                if injected_conditioning.shape[-1] != encoder_hidden_states.shape[-1]:
+                    if self.projection_layer is None:
+                        source_dim = injected_conditioning.shape[-1]
+                        target_dim = encoder_hidden_states.shape[-1]
+                        self.projection_layer = torch.nn.Linear(source_dim, target_dim)
+                        self.projection_layer.to(device=encoder_hidden_states.device, dtype=encoder_hidden_states.dtype)
+                    injected_conditioning = self.projection_layer(injected_conditioning)
+                result = injected_conditioning * torch.tensor(self.weight, device=injected_conditioning.device, dtype=injected_conditioning.dtype)
+            
+            return result
+        except Exception as e:
+            logger.error(f"Failed to apply injection for block {self.block_id}: {e}", exc_info=True)
+            # Return original states as a fallback
+            return encoder_hidden_states
     
     def _apply_spatial_masking(self, attention_output: torch.Tensor, 
                               original_hidden_states: torch.Tensor,
@@ -326,50 +355,55 @@ class PromptInjectionProcessor:
                               attention_mask: Optional[torch.Tensor] = None,
                               timestep: Optional[int] = None, **kwargs) -> torch.Tensor:
         """Apply spatial masking to attention output by blending with original."""
-        if self.spatial_mask is None:
-            return attention_output
-        
-        # Run original attention without injection to get baseline
-        original_attention_output = self._compute_attention(
-            attn, original_hidden_states, encoder_hidden_states, 
-            attention_mask, **kwargs
-        )
-        
-        # Prepare spatial mask
-        spatial_mask = self.spatial_mask.to(
-            device=attention_output.device,
-            dtype=attention_output.dtype
-        )
-        
-        # Ensure mask matches spatial dimensions
-        seq_len = attention_output.shape[1]  # Spatial sequence length
-        if spatial_mask.shape[0] != seq_len:
-            if spatial_mask.shape[0] > seq_len:
-                spatial_mask = spatial_mask[:seq_len]
-            else:
-                # Pad or interpolate mask to match sequence length
-                spatial_mask = torch.nn.functional.interpolate(
-                    spatial_mask.unsqueeze(0).unsqueeze(0).to(attention_output.dtype),
-                    size=(seq_len,), mode='linear', align_corners=False
-                )[0, 0]
-        
-        # Apply spatial mask: blend injection (attention_output) and original  
-        spatial_mask = spatial_mask.unsqueeze(-1)  # Add feature dimension
-        
-        # Broadcast mask for batch size
-        if attention_output.shape[0] > 1:
-            spatial_mask = spatial_mask.unsqueeze(0).expand(attention_output.shape[0], -1, -1)
-        else:
-            spatial_mask = spatial_mask.unsqueeze(0)
+        try:
+            if self.spatial_mask is None:
+                return attention_output
             
-        
-        # Blend: mask=1 uses injection, mask=0 uses original
-        blended_output = (
-            spatial_mask * attention_output + 
-            (torch.ones_like(spatial_mask) - spatial_mask) * original_attention_output
-        )
-        
-        return blended_output
+            # Run original attention without injection to get baseline
+            original_attention_output = self._compute_attention(
+                attn, original_hidden_states, encoder_hidden_states, 
+                attention_mask, **kwargs
+            )
+            
+            # Prepare spatial mask
+            spatial_mask = self.spatial_mask.to(
+                device=attention_output.device,
+                dtype=attention_output.dtype
+            )
+            
+            # Ensure mask matches spatial dimensions
+            seq_len = attention_output.shape[1]  # Spatial sequence length
+            if spatial_mask.shape[0] != seq_len:
+                if spatial_mask.shape[0] > seq_len:
+                    spatial_mask = spatial_mask[:seq_len]
+                else:
+                    # Pad or interpolate mask to match sequence length
+                    spatial_mask = torch.nn.functional.interpolate(
+                        spatial_mask.unsqueeze(0).unsqueeze(0).to(attention_output.dtype),
+                        size=(seq_len,), mode='linear', align_corners=False
+                    )[0, 0]
+            
+            # Apply spatial mask: blend injection (attention_output) and original  
+            spatial_mask = spatial_mask.unsqueeze(-1)  # Add feature dimension
+            
+            # Broadcast mask for batch size
+            if attention_output.shape[0] > 1:
+                spatial_mask = spatial_mask.unsqueeze(0).expand(attention_output.shape[0], -1, -1)
+            else:
+                spatial_mask = spatial_mask.unsqueeze(0)
+                
+            
+            # Blend: mask=1 uses injection, mask=0 uses original
+            blended_output = (
+                spatial_mask * attention_output + 
+                (torch.ones_like(spatial_mask) - spatial_mask) * original_attention_output
+            )
+            
+            return blended_output
+        except Exception as e:
+            logger.error(f"Error during spatial masking for block {self.block_id}: {e}", exc_info=True)
+            # Fallback to the injected (but not masked) output
+            return attention_output
     
     def set_current_sigma(self, sigma: float):
         """Set current sigma for injection timing control."""
@@ -388,29 +422,34 @@ class UNetSigmaHook:
     
     def __call__(self, module, args, kwargs=None):
         """Hook called before UNet forward pass."""
-        if not hasattr(self.scheduler, "sigmas"):
-            return
-        
-        timestep = args[1]
-        
-        if not isinstance(timestep, torch.Tensor):
-            # Timestep is not a tensor, cannot proceed
-            return
+        try:
+            if not hasattr(self.scheduler, "sigmas"):
+                return
             
-        # Find the index of the current timestep in the scheduler's timesteps
-        # Squeeze to handle cases where timesteps might have extra dimensions
-        condition = self.scheduler.timesteps == timestep.squeeze()
-        
-        # Check if the condition tensor is on a different device and move it
-        if condition.device != self.scheduler.timesteps.device:
-            condition = condition.to(self.scheduler.timesteps.device)
+            timestep = args[1]
+            
+            if not isinstance(timestep, torch.Tensor):
+                # Timestep is not a tensor, cannot proceed
+                return
+                
+            # Find the index of the current timestep in the scheduler's timesteps
+            # Squeeze to handle cases where timesteps might have extra dimensions
+            condition = self.scheduler.timesteps == timestep.squeeze()
+            
+            # Check if the condition tensor is on a different device and move it
+            if condition.device != self.scheduler.timesteps.device:
+                condition = condition.to(self.scheduler.timesteps.device)
 
-        matching_indices = torch.where(condition)[0]
-        
-        if matching_indices.numel() > 0:
-            idx = matching_indices[0]
-            sigma = self.scheduler.sigmas[idx]
-            self.set_sigma(sigma.item())
+            matching_indices = torch.where(condition)[0]
+            
+            if matching_indices.numel() > 0:
+                idx = matching_indices[0]
+                sigma = self.scheduler.sigmas[idx]
+                self.set_sigma(sigma.item())
+        except Exception as e:
+            logger.error(f"Error in UNetSigmaHook: {e}", exc_info=True)
+            # Do not re-raise, as this could crash the forward pass
+            pass
 
     def set_sigma(self, sigma: float):
         """Set current sigma and update all injection processors."""
@@ -664,6 +703,10 @@ class UNetPatcher(BaseModelPatcher):
         """
         Recursively collect cross-attention modules from a block.
         """
+        # Some modules might not have children (e.g., final layers)
+        if not hasattr(module, 'named_children'):
+            return
+            
         for name, child in module.named_children():
             child_path = f"{path}.{name}"
             

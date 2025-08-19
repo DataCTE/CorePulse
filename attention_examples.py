@@ -49,26 +49,24 @@ def attention_manipulation_example():
     # 2. Generate with increased attention on "photorealistic"
     print("Generating with increased attention on 'photorealistic'...")
     generator = torch.Generator(device=device).manual_seed(seed)
-    injector.clear_injections() # Clear any previous configs
     injector.add_attention_manipulation(
         block="all",
         target_phrase="photorealistic",
-        attention_scale=2.0,
+        attention_scale=5.0, # Increased from 2.0
         sigma_start=14.0,
         sigma_end=0.1
     )
     with injector:
         boosted_image = injector(prompt=base_prompt, generator=generator, num_inference_steps=30).images[0]
         
-    # 3. Generate with reduced attention on "astronaut" in the background
+    # 3. Generate with reduced attention on "astronaut" in the background (layered on top)
     print("Generating with reduced attention on 'astronaut' in the background...")
     generator = torch.Generator(device=device).manual_seed(seed)
-    injector.clear_injections() # Clear any previous configs
     background_mask = create_rectangle_mask(0, 0, 1024, 512, (1024, 1024)) # Top half
     injector.add_attention_manipulation(
         block="all",
         target_phrase="astronaut",
-        attention_scale=0.1,
+        attention_scale=0.05, # Decreased from 0.1
         spatial_mask=background_mask,
         sigma_start=14.0,
         sigma_end=0.1
