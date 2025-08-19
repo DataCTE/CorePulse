@@ -8,6 +8,7 @@ from diffusers import DiffusionPipeline
 
 from .base import BasePromptInjector, PromptInjectionConfig
 from ..models.base import BlockIdentifier
+from ..utils.logger import logger
 
 
 class AdvancedPromptInjector(BasePromptInjector):
@@ -32,29 +33,39 @@ class AdvancedPromptInjector(BasePromptInjector):
                           Format: {"block": "input:4", "prompt": "text", "weight": 1.0, ...}
                           Or list of such dictionaries
         """
+        logger.info(f"Configuring {len(injection_map)} injections.")
         self.clear_injections()
         
-        if isinstance(injection_map, dict):
-            injection_map = [injection_map]
-        
-        for config_dict in injection_map:
-            block = config_dict["block"]
-            prompt = config_dict["prompt"]
-            weight = config_dict.get("weight", 1.0)
-            sigma_start = config_dict.get("sigma_start", 0.0)
-            sigma_end = config_dict.get("sigma_end", 1.0)
+        try:
+            if isinstance(injection_map, dict):
+                injection_map = [injection_map]
             
-            config = PromptInjectionConfig(
-                block=block,
-                prompt=prompt,
-                weight=weight,
-                sigma_start=sigma_start,
-                sigma_end=sigma_end,
-                spatial_mask=config_dict.get("spatial_mask")
-            )
-            
-            block_id = BlockIdentifier.from_string(block) if isinstance(block, str) else block
-            self.configs[block_id] = config
+            for config_dict in injection_map:
+                block = config_dict["block"]
+                prompt = config_dict["prompt"]
+                logger.debug(f"Parsing injection for block '{block}' with prompt '{prompt}'")
+                
+                weight = config_dict.get("weight", 1.0)
+                sigma_start = config_dict.get("sigma_start", 0.0)
+                sigma_end = config_dict.get("sigma_end", 1.0)
+                
+                config = PromptInjectionConfig(
+                    block=block,
+                    prompt=prompt,
+                    weight=weight,
+                    sigma_start=sigma_start,
+                    sigma_end=sigma_end,
+                    spatial_mask=config_dict.get("spatial_mask")
+                )
+                
+                block_id = BlockIdentifier.from_string(block) if isinstance(block, str) else block
+                self.configs[block_id] = config
+        except KeyError as e:
+            logger.error(f"Injection configuration is missing required key: {e}", exc_info=True)
+            raise
+        except Exception as e:
+            logger.error(f"Failed to configure injections: {e}", exc_info=True)
+            raise
     
     def add_injection(self,
                      block: Union[str, BlockIdentifier],
@@ -74,12 +85,18 @@ class AdvancedPromptInjector(BasePromptInjector):
             sigma_end: End of injection window
             spatial_mask: Optional spatial mask for regional control
         """
-        if isinstance(block, str) and block.lower() == "all":
-            all_blocks = self.patcher.block_mapper.get_all_block_identifiers()
-            for block_id_str in all_blocks:
-                self._add_single_injection(block_id_str, prompt, weight, sigma_start, sigma_end, spatial_mask)
-        else:
-            self._add_single_injection(block, prompt, weight, sigma_start, sigma_end, spatial_mask)
+        logger.debug(f"Adding injection for block: {block}, prompt: '{prompt}'")
+        try:
+            if isinstance(block, str) and block.lower() == "all":
+                logger.info("Applying injection to all available blocks.")
+                all_blocks = self.patcher.block_mapper.get_all_block_identifiers()
+                for block_id_str in all_blocks:
+                    self._add_single_injection(block_id_str, prompt, weight, sigma_start, sigma_end, spatial_mask)
+            else:
+                self._add_single_injection(block, prompt, weight, sigma_start, sigma_end, spatial_mask)
+        except Exception as e:
+            logger.error(f"Failed to add injection for block '{block}': {e}", exc_info=True)
+            raise
 
     def _add_single_injection(self, block, prompt, weight, sigma_start, sigma_end, spatial_mask):
         """Helper to add a single injection config."""
@@ -92,6 +109,7 @@ class AdvancedPromptInjector(BasePromptInjector):
             spatial_mask=spatial_mask
         )
         block_id = BlockIdentifier.from_string(block) if isinstance(block, str) else block
+        logger.debug(f"Stored injection config for block_id: {block_id}")
         self.configs[block_id] = config
     
     def remove_injection(self, block: Union[str, BlockIdentifier]):
@@ -101,9 +119,17 @@ class AdvancedPromptInjector(BasePromptInjector):
         Args:
             block: Block identifier to remove
         """
-        block_id = BlockIdentifier.from_string(block) if isinstance(block, str) else block
-        if block_id in self.configs:
-            del self.configs[block_id]
+        logger.debug(f"Removing injection for block: {block}")
+        try:
+            block_id = BlockIdentifier.from_string(block) if isinstance(block, str) else block
+            if block_id in self.configs:
+                del self.configs[block_id]
+                logger.info(f"Removed injection for block: {block_id}")
+            else:
+                logger.warning(f"Attempted to remove injection for block {block_id}, but none was found.")
+        except Exception as e:
+            logger.error(f"Failed to remove injection for block '{block}': {e}", exc_info=True)
+            raise
     
     def get_injection_summary(self) -> List[Dict[str, Any]]:
         """
@@ -112,6 +138,7 @@ class AdvancedPromptInjector(BasePromptInjector):
         Returns:
             List of injection summaries
         """
+        logger.debug("Generating injection summary.")
         summaries = []
         for block_id, config in self.configs.items():
             summaries.append({
@@ -133,25 +160,32 @@ class AdvancedPromptInjector(BasePromptInjector):
         Returns:
             Modified pipeline
         """
-        if not self.configs:
-            raise ValueError("No injections configured. Add injections first.")
+        # Check if there are any prompt injections or attention map configs in the patcher
+        if not self.configs and not self.patcher.attention_map_configs:
+            raise ValueError("No injections or attention manipulations configured. Add them first.")
         
+        logger.info(f"Encoding {len(self.configs)} prompts for injection.")
         # Encode all prompts and add to patcher
         for block_id, config in self.configs.items():
-            # Use pre-encoded prompt if available, otherwise encode the prompt
-            if config._encoded_prompt is not None:
-                encoded_prompt = config._encoded_prompt
-            else:
-                encoded_prompt = self.encode_prompt(config.prompt, pipeline)
-            
-            self.patcher.add_injection(
-                block=block_id,
-                conditioning=encoded_prompt,
-                weight=config.weight,
-                sigma_start=config.sigma_start,
-                sigma_end=config.sigma_end,
-                spatial_mask=config.spatial_mask
-            )
+            try:
+                # Use pre-encoded prompt if available, otherwise encode the prompt
+                if config._encoded_prompt is not None:
+                    logger.debug(f"Using pre-encoded prompt for block {block_id}")
+                    encoded_prompt = config._encoded_prompt
+                else:
+                    encoded_prompt = self.encode_prompt(config.prompt, pipeline)
+                
+                self.patcher.add_injection(
+                    block=block_id,
+                    conditioning=encoded_prompt,
+                    weight=config.weight,
+                    sigma_start=config.sigma_start,
+                    sigma_end=config.sigma_end,
+                    spatial_mask=config.spatial_mask
+                )
+            except Exception as e:
+                logger.error(f"Failed to process and add injection for block {block_id}: {e}", exc_info=True)
+                raise
         
         return super().apply_to_pipeline(pipeline)
     
@@ -183,27 +217,32 @@ class LocationBasedInjector(AdvancedPromptInjector):
             sigma_start: Start of injection window
             sigma_end: End of injection window
         """
+        logger.info("Configuring injections from location string.")
         self.clear_injections()
         
-        for line in locations_str.strip().split('\n'):
-            line = line.strip()
-            if not line:
-                continue
-            
-            weight = 1.0
-            if ',' in line:
-                block_str, weight_str = line.split(',', 1)
-                weight = float(weight_str.strip())
-            else:
-                block_str = line
-            
-            self.add_injection(
-                block=block_str.strip(),
-                prompt=prompt,
-                weight=weight,
-                sigma_start=sigma_start,
-                sigma_end=sigma_end
-            )
+        try:
+            for line in locations_str.strip().split('\n'):
+                line = line.strip()
+                if not line:
+                    continue
+                
+                weight = 1.0
+                if ',' in line:
+                    block_str, weight_str = line.split(',', 1)
+                    weight = float(weight_str.strip())
+                else:
+                    block_str = line
+                
+                self.add_injection(
+                    block=block_str.strip(),
+                    prompt=prompt,
+                    weight=weight,
+                    sigma_start=sigma_start,
+                    sigma_end=sigma_end
+                )
+        except Exception as e:
+            logger.error(f"Failed to parse location string: '{locations_str}'. Error: {e}", exc_info=True)
+            raise
 
 
 class MultiPromptInjector(AdvancedPromptInjector):
@@ -225,22 +264,27 @@ class MultiPromptInjector(AdvancedPromptInjector):
             weights: Optional mapping of block identifiers to weights
             sigma_ranges: Optional mapping of block identifiers to (start, end) sigma ranges
         """
+        logger.info(f"Configuring {len(block_prompts)} block-specific prompts.")
         self.clear_injections()
         
-        weights = weights or {}
-        sigma_ranges = sigma_ranges or {}
-        
-        for block_str, prompt in block_prompts.items():
-            weight = weights.get(block_str, 1.0)
-            sigma_start, sigma_end = sigma_ranges.get(block_str, (0.0, 1.0))
+        try:
+            weights = weights or {}
+            sigma_ranges = sigma_ranges or {}
             
-            self.add_injection(
-                block=block_str,
-                prompt=prompt,
-                weight=weight,
-                sigma_start=sigma_start,
-                sigma_end=sigma_end
-            )
+            for block_str, prompt in block_prompts.items():
+                weight = weights.get(block_str, 1.0)
+                sigma_start, sigma_end = sigma_ranges.get(block_str, (0.0, 1.0))
+                
+                self.add_injection(
+                    block=block_str,
+                    prompt=prompt,
+                    weight=weight,
+                    sigma_start=sigma_start,
+                    sigma_end=sigma_end
+                )
+        except Exception as e:
+            logger.error(f"Failed to configure block prompts: {e}", exc_info=True)
+            raise
     
     def add_content_style_split(self,
                               content_prompt: str,
@@ -256,14 +300,24 @@ class MultiPromptInjector(AdvancedPromptInjector):
             content_weight: Weight for content injection
             style_weight: Weight for style injection
         """
-        # Get all available middle and output blocks for the current model
-        middle_blocks = self.patcher.block_mapper.blocks.get('middle', [])
-        output_blocks = self.patcher.block_mapper.blocks.get('output', [])
-
-        # Configure content blocks (middle)
-        for i in middle_blocks:
-            self.add_injection(f"middle:{i}", content_prompt, content_weight)
+        logger.info("Adding content/style split.")
+        logger.debug(f"  - Content prompt: '{content_prompt}' (weight: {content_weight})")
+        logger.debug(f"  - Style prompt: '{style_prompt}' (weight: {style_weight})")
         
-        # Configure style blocks (output)
-        for i in output_blocks:
-            self.add_injection(f"output:{i}", style_prompt, style_weight)
+        try:
+            # Get all available middle and output blocks for the current model
+            middle_blocks = self.patcher.block_mapper.blocks.get('middle', [])
+            output_blocks = self.patcher.block_mapper.blocks.get('output', [])
+
+            # Configure content blocks (middle)
+            logger.debug(f"Applying content prompt to middle blocks: {middle_blocks}")
+            for i in middle_blocks:
+                self.add_injection(f"middle:{i}", content_prompt, content_weight)
+            
+            # Configure style blocks (output)
+            logger.debug(f"Applying style prompt to output blocks: {output_blocks}")
+            for i in output_blocks:
+                self.add_injection(f"output:{i}", style_prompt, style_weight)
+        except Exception as e:
+            logger.error(f"Failed to add content/style split: {e}", exc_info=True)
+            raise

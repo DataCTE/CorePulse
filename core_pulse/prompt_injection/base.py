@@ -11,6 +11,7 @@ from dataclasses import dataclass, field
 from ..models.base import BlockIdentifier
 from ..models.unet_patcher import UNetPatcher
 from ..utils.helpers import detect_model_type
+from ..utils.logger import logger
 
 
 @dataclass
@@ -31,10 +32,15 @@ class BasePromptInjector(ABC):
     """
     
     def __init__(self, pipeline: DiffusionPipeline):
-        self.patcher = UNetPatcher(pipeline.unet, pipeline.scheduler)
-        self.configs: Dict[BlockIdentifier, PromptInjectionConfig] = {}
-        self._pipeline = pipeline
-        self._is_applied = False
+        logger.debug(f"Initializing {self.__class__.__name__} for pipeline: {pipeline.__class__.__name__}")
+        try:
+            self.patcher = UNetPatcher(pipeline.unet, pipeline.scheduler)
+            self.configs: Dict[BlockIdentifier, PromptInjectionConfig] = {}
+            self._pipeline = pipeline
+            self._is_applied = False
+        except Exception as e:
+            logger.error(f"Error initializing BasePromptInjector: {e}", exc_info=True)
+            raise
 
     @property
     def model_type(self) -> str:
@@ -45,25 +51,43 @@ class BasePromptInjector(ABC):
 
     def clear_injections(self):
         """Clear all injections and remove patches."""
-        self.configs.clear()
-        if self._pipeline:
-            self.patcher.remove_patches(self._pipeline.unet)
-        self.patcher.clear_injections()
+        logger.debug("Clearing all injections and removing patches.")
+        try:
+            self.configs.clear()
+            if self._pipeline:
+                self.patcher.remove_patches(self._pipeline.unet)
+            self.patcher.clear_injections()
+        except Exception as e:
+            logger.error(f"Error in clear_injections: {e}", exc_info=True)
+            raise
 
     def apply_to_pipeline(self, pipeline: DiffusionPipeline) -> DiffusionPipeline:
         """Apply all configured injections to the pipeline."""
-        self.patcher.apply_patches(pipeline.unet)
-        self._is_applied = True
-        return pipeline
+        logger.debug(f"Applying patches to pipeline: {pipeline.__class__.__name__}")
+        try:
+            self.patcher.apply_patches(pipeline.unet)
+            self._is_applied = True
+            logger.info("Successfully applied patches to the pipeline.")
+            return pipeline
+        except Exception as e:
+            logger.error(f"Error applying patches to pipeline: {e}", exc_info=True)
+            raise
 
     def encode_prompt(self, prompt: str, pipeline: DiffusionPipeline) -> torch.Tensor:
         """Encode a prompt using the pipeline's text encoder."""
-        return pipeline.encode_prompt(
-            prompt=prompt,
-            device=pipeline.device,
-            num_images_per_prompt=1,
-            do_classifier_free_guidance=False
-        )[0]
+        logger.debug(f"Encoding prompt: '{prompt}'")
+        try:
+            encoded = pipeline.encode_prompt(
+                prompt=prompt,
+                device=pipeline.device,
+                num_images_per_prompt=1,
+                do_classifier_free_guidance=False
+            )[0]
+            logger.debug(f"Prompt encoded into tensor of shape: {encoded.shape}")
+            return encoded
+        except Exception as e:
+            logger.error(f"Error encoding prompt '{prompt}': {e}", exc_info=True)
+            raise
 
     def __enter__(self):
         """Apply patches when entering context."""
@@ -73,10 +97,19 @@ class BasePromptInjector(ABC):
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         """Remove patches when exiting context."""
+        logger.debug("Exiting context, clearing injections.")
         self.clear_injections()
 
     def __call__(self, *args, **kwargs):
         """Make the injector callable to pass through to the pipeline."""
         if not self._is_applied or self._pipeline is None:
-            raise RuntimeError("Injector has not been applied to a pipeline.")
-        return self._pipeline(*args, **kwargs)
+            msg = "Injector has not been applied to a pipeline. Call apply_to_pipeline or use a 'with' block."
+            logger.error(msg)
+            raise RuntimeError(msg)
+        
+        logger.debug(f"Calling patched pipeline with args: {args}, kwargs: {kwargs}")
+        try:
+            return self._pipeline(*args, **kwargs)
+        except Exception as e:
+            logger.error(f"Error during patched pipeline execution: {e}", exc_info=True)
+            raise

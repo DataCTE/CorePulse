@@ -24,6 +24,7 @@ from .spatial import (
     # Strip masks
     create_horizontal_strip_mask, create_vertical_strip_mask
 )
+from .attention import AttentionMapInjector
 
 __all__ = [
     "BasePromptInjector",
@@ -34,6 +35,7 @@ __all__ = [
     "TokenAnalyzer", 
     "MaskedPromptEncoder",
     "RegionalPromptInjector",
+    "AttentionMapInjector",
     "RegionalComposition",
     "CompositionLayer",
     "BlendMode",

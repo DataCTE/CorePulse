@@ -4,9 +4,7 @@ Base classes for model patching in CorePulse.
 
 from abc import ABC, abstractmethod
 from typing import Any, Dict, Optional, Callable
-import torch
-from diffusers import DiffusionPipeline
-from dataclasses import dataclass
+from ..utils.logger import logger
 
 
 class BaseModelPatcher(ABC):
@@ -18,43 +16,51 @@ class BaseModelPatcher(ABC):
     """
     
     def __init__(self):
+        logger.debug(f"Initializing {self.__class__.__name__}.")
         self.patches: Dict[str, Any] = {}
         self.is_patched = False
         self.original_methods: Dict[str, Callable] = {}
     
     @abstractmethod
-    def apply_patches(self, pipeline: DiffusionPipeline) -> DiffusionPipeline:
+    def apply_patches(self, model: Any) -> Any:
         """
-        Apply patches to the given pipeline.
+        Apply patches to the given model component (e.g., UNet).
         
         Args:
-            pipeline: The diffusion pipeline to patch
+            model: The model component to patch.
             
         Returns:
-            The patched pipeline
+            The patched model component.
         """
         pass
     
     @abstractmethod
-    def remove_patches(self, pipeline: DiffusionPipeline) -> DiffusionPipeline:
+    def remove_patches(self, model: Any) -> Any:
         """
-        Remove patches from the given pipeline.
+        Remove patches from the given model component.
         
         Args:
-            pipeline: The patched pipeline to restore
+            model: The patched model component to restore.
             
         Returns:
-            The restored pipeline
+            The restored model component.
         """
         pass
     
     def __enter__(self):
         """Context manager entry."""
+        logger.debug(f"Entering context for {self.__class__.__name__}.")
         return self
     
     def __exit__(self, exc_type, exc_val, exc_tb):
         """Context manager exit - cleanup patches."""
-        if hasattr(self, '_patched_pipeline') and self._patched_pipeline is not None:
+        logger.debug(f"Exiting context for {self.__class__.__name__}, cleaning up patches.")
+        if hasattr(self, '_hooked_unet') and self._hooked_unet is not None:
+            try:
+                self.remove_patches(self._hooked_unet)
+            except Exception as e:
+                logger.error(f"Error during patch removal in __exit__: {e}", exc_info=True)
+        elif hasattr(self, '_patched_pipeline') and self._patched_pipeline is not None:
             self.remove_patches(self._patched_pipeline)
 
 
@@ -92,13 +98,17 @@ class BlockIdentifier:
         Returns:
             BlockIdentifier instance
         """
-        if ':' not in block_str:
-            raise ValueError(f"Invalid block string format: {block_str}. Expected 'type:index'")
-        
-        block_type, block_index_str = block_str.split(':', 1)
         try:
+            if ':' not in block_str:
+                raise ValueError(f"Invalid block string format: {block_str}. Expected 'type:index'")
+            
+            block_type, block_index_str = block_str.split(':', 1)
             block_index = int(block_index_str)
-        except ValueError:
-            raise ValueError(f"Invalid block index: {block_index_str}. Must be an integer")
-        
-        return cls(block_type, block_index)
+            
+            return cls(block_type, block_index)
+        except ValueError as e:
+            logger.error(f"Failed to create BlockIdentifier from string: '{block_str}'. {e}")
+            raise
+        except Exception as e:
+            logger.error(f"An unexpected error occurred in BlockIdentifier.from_string: {e}", exc_info=True)
+            raise

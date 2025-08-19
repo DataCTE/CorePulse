@@ -12,6 +12,8 @@ from diffusers import UNet2DConditionModel
 from diffusers.models.attention_processor import Attention, AttnProcessor2_0
 from diffusers.schedulers.scheduling_utils import SchedulerMixin
 from .base import BaseModelPatcher, BlockIdentifier
+from dataclasses import dataclass
+from ..utils.logger import logger
 
 
 class UNetBlockMapper:
@@ -91,6 +93,16 @@ class UNetBlockMapper:
             raise ValueError(f"Unknown block type: {block.block_type}")
 
 
+@dataclass
+class AttentionMapConfig:
+    """Configuration for a single attention map manipulation."""
+    target_token_indices: List[int]
+    attention_scale: float
+    spatial_mask: Optional[torch.Tensor] = None
+    sigma_start: float = 14.0
+    sigma_end: float = 0.0
+
+
 class PromptInjectionProcessor:
     """
     Custom attention processor for injecting prompts at specific blocks.
@@ -100,9 +112,10 @@ class PromptInjectionProcessor:
     at specific blocks and timesteps with optional spatial control.
     """
     
-    def __init__(self, original_processor, block_id: str, conditioning: torch.Tensor, 
+    def __init__(self, original_processor, block_id: str, conditioning: Optional[torch.Tensor] = None, 
                  weight: float = 1.0, sigma_start: float = 0.0, sigma_end: float = 1.0,
-                 spatial_mask: Optional[torch.Tensor] = None):
+                 spatial_mask: Optional[torch.Tensor] = None,
+                 attention_maps: Optional[List[AttentionMapConfig]] = None):
         self.original_processor = original_processor
         self.block_id = block_id  # e.g., "middle:0", "output:1"
         self.conditioning = conditioning
@@ -110,6 +123,7 @@ class PromptInjectionProcessor:
         self.sigma_start = sigma_start  # Higher values (more noise)
         self.sigma_end = sigma_end      # Lower values (less noise)
         self.spatial_mask = spatial_mask  # Optional spatial mask for regional control
+        self.attention_maps = attention_maps or []
         self.projection_layer = None # For handling mismatched dimensions
         
         # Parse block info
@@ -144,7 +158,7 @@ class PromptInjectionProcessor:
                 injected_states = self._apply_injection(encoder_hidden_states)
                 
                 # Run attention with injected conditioning
-                attention_output = self.original_processor(
+                attention_output = self._compute_attention(
                     attn, hidden_states, injected_states, attention_mask, **kwargs
                 )
                 
@@ -157,15 +171,102 @@ class PromptInjectionProcessor:
                 # Non-spatial injection: standard approach
                 original_shape = encoder_hidden_states.shape
                 encoder_hidden_states = self._apply_injection(encoder_hidden_states)
-        else:
-            pass
-            # print(f"NOT injecting at {self.block_id} (should_inject: {should_inject}, has_conditioning: {self.conditioning is not None})")
-        
-        # Call original processor
-        return self.original_processor(
+
+        # Standard attention computation (or with injected states)
+        return self._compute_attention(
             attn, hidden_states, encoder_hidden_states, attention_mask, **kwargs
         )
     
+    def _compute_attention(self, attn: Attention, hidden_states: torch.Tensor,
+                           encoder_hidden_states: Optional[torch.Tensor] = None,
+                           attention_mask: Optional[torch.Tensor] = None,
+                           **kwargs) -> torch.Tensor:
+        """
+        Replicates the logic of AttnProcessor2_0 to allow for attention score manipulation.
+        """
+        residual = hidden_states
+        input_ndim = hidden_states.ndim
+        
+        if input_ndim == 4:
+            batch_size, channel, height, width = hidden_states.shape
+            hidden_states = hidden_states.view(batch_size, channel, height * width).transpose(1, 2)
+        
+        batch_size, sequence_length, _ = (
+            hidden_states.shape if encoder_hidden_states is None else encoder_hidden_states.shape
+        )
+        
+        attention_mask = attn.prepare_attention_mask(attention_mask, sequence_length, batch_size)
+        
+        query = attn.to_q(hidden_states)
+        
+        if encoder_hidden_states is None:
+            encoder_hidden_states = hidden_states
+        
+        key = attn.to_k(encoder_hidden_states)
+        value = attn.to_v(encoder_hidden_states)
+        
+        query = attn.head_to_batch_dim(query)
+        key = attn.head_to_batch_dim(key)
+        value = attn.head_to_batch_dim(value)
+        
+        attention_probs = attn.get_attention_scores(query, key, attention_mask)
+        
+        # --- ATTENTION MAP MANIPULATION ---
+        current_sigma = getattr(self, '_current_sigma', None)
+        for attn_map in self.attention_maps:
+            if current_sigma is None or (current_sigma <= attn_map.sigma_start and current_sigma >= attn_map.sigma_end):
+                
+                # Filter indices to prevent out-of-bounds errors
+                max_token_idx = attention_probs.shape[-1]
+                valid_indices = [idx for idx in attn_map.target_token_indices if idx < max_token_idx]
+                
+                if not valid_indices:
+                    continue
+
+                logger.debug(f"[{self.block_id}] Applying attention map scale {attn_map.attention_scale} to tokens {valid_indices}")
+                
+                # Log stats before manipulation
+                logger.debug(f"  - Attn scores BEFORE: mean={attention_probs.mean().item():.4f}, max={attention_probs.max().item():.4f}")
+
+                # Apply scaling to the specified token indices
+                # Shape of attention_probs: (batch_size * num_heads, pixel_patches, text_tokens)
+                scale_tensor = torch.ones_like(attention_probs)
+                
+                # Prepare spatial mask if it exists
+                if attn_map.spatial_mask is not None:
+                    spatial_mask = attn_map.spatial_mask.to(device=scale_tensor.device, dtype=scale_tensor.dtype)
+                    # Reshape mask to match (1, pixel_patches, 1) for broadcasting
+                    spatial_mask = spatial_mask.unsqueeze(0).unsqueeze(-1) 
+                    # Apply scale only where mask is > 0
+                    scale_factor = torch.where(spatial_mask > 0, attn_map.attention_scale, 1.0)
+                else:
+                    scale_factor = attn_map.attention_scale
+
+                scale_tensor[:, :, valid_indices] *= scale_factor
+                attention_probs = attention_probs * scale_tensor
+                
+                # Log stats after manipulation
+                logger.debug(f"  - Attn scores AFTER:  mean={attention_probs.mean().item():.4f}, max={attention_probs.max().item():.4f}")
+        # --- END MANIPULATION ---
+
+        hidden_states = torch.bmm(attention_probs, value)
+        hidden_states = attn.batch_to_head_dim(hidden_states)
+        
+        # linear proj
+        hidden_states = attn.to_out[0](hidden_states)
+        # dropout
+        hidden_states = attn.to_out[1](hidden_states)
+        
+        if input_ndim == 4:
+            hidden_states = hidden_states.transpose(-1, -2).reshape(batch_size, channel, height, width)
+
+        if attn.residual_connection:
+            hidden_states = hidden_states + residual
+
+        hidden_states = hidden_states / attn.rescale_output_factor
+        
+        return hidden_states
+
     def _should_inject(self, current_sigma: Optional[float]) -> bool:
         """Check if we should inject based on current sigma."""
         if current_sigma is None:
@@ -229,9 +330,9 @@ class PromptInjectionProcessor:
             return attention_output
         
         # Run original attention without injection to get baseline
-        original_attention_output = self.original_processor(
+        original_attention_output = self._compute_attention(
             attn, original_hidden_states, encoder_hidden_states, 
-            attention_mask, timestep, **kwargs
+            attention_mask, **kwargs
         )
         
         # Prepare spatial mask
@@ -293,19 +394,28 @@ class UNetSigmaHook:
         timestep = args[1]
         
         if not isinstance(timestep, torch.Tensor):
-             return
+            # Timestep is not a tensor, cannot proceed
+            return
             
-        sigma = self.scheduler.sigmas[0] # Fallback
-        if timestep.ndim > 0 and len(timestep) > 0:
-            timestep_index = (self.scheduler.timesteps == timestep[0]).nonzero()
-            if timestep_index.numel() > 0:
-                sigma = self.scheduler.sigmas[timestep_index.item()]
+        # Find the index of the current timestep in the scheduler's timesteps
+        # Squeeze to handle cases where timesteps might have extra dimensions
+        condition = self.scheduler.timesteps == timestep.squeeze()
+        
+        # Check if the condition tensor is on a different device and move it
+        if condition.device != self.scheduler.timesteps.device:
+            condition = condition.to(self.scheduler.timesteps.device)
 
-        self.set_sigma(sigma.item())
-    
+        matching_indices = torch.where(condition)[0]
+        
+        if matching_indices.numel() > 0:
+            idx = matching_indices[0]
+            sigma = self.scheduler.sigmas[idx]
+            self.set_sigma(sigma.item())
+
     def set_sigma(self, sigma: float):
         """Set current sigma and update all injection processors."""
         self.current_sigma = sigma
+        logger.debug(f"UNetSigmaHook: Current sigma set to {sigma:.4f}")
         for processor in self.patcher._injection_processors.values():
             processor.set_current_sigma(sigma)
 
@@ -322,6 +432,7 @@ class UNetPatcher(BaseModelPatcher):
         super().__init__()
         self.block_mapper = UNetBlockMapper(unet)
         self.injection_configs: Dict[str, Dict[str, Any]] = {}
+        self.attention_map_configs: Dict[str, List[AttentionMapConfig]] = {}
         self._original_processors: Dict[str, Any] = {}
         self._injection_processors: Dict[str, PromptInjectionProcessor] = {}
         self._sigma_hook = UNetSigmaHook(self, scheduler)
@@ -379,9 +490,42 @@ class UNetPatcher(BaseModelPatcher):
             'spatial_mask': spatial_mask
         }
     
+    def add_attention_manipulation(self, block: Union[str, BlockIdentifier],
+                                 target_token_indices: List[int],
+                                 attention_scale: float = 1.0,
+                                 sigma_start: float = 1.0,
+                                 sigma_end: float = 0.0,
+                                 spatial_mask: Optional[torch.Tensor] = None):
+        """
+        Add an attention map manipulation for a specific block or all blocks.
+        """
+        config = AttentionMapConfig(
+            target_token_indices=target_token_indices,
+            attention_scale=attention_scale,
+            sigma_start=sigma_start,
+            sigma_end=sigma_end,
+            spatial_mask=spatial_mask
+        )
+
+        if isinstance(block, str) and block.lower() == "all":
+            all_blocks = self.block_mapper.get_all_block_identifiers()
+            for block_id in all_blocks:
+                if block_id not in self.attention_map_configs:
+                    self.attention_map_configs[block_id] = []
+                self.attention_map_configs[block_id].append(config)
+        else:
+            block_id = str(block) if isinstance(block, BlockIdentifier) else block
+            if not self.block_mapper.is_valid_block(BlockIdentifier.from_string(block_id)):
+                raise ValueError(f"Invalid block: {block_id}")
+            
+            if block_id not in self.attention_map_configs:
+                self.attention_map_configs[block_id] = []
+            self.attention_map_configs[block_id].append(config)
+
     def clear_injections(self):
         """Clear all prompt injections."""
         self.injection_configs.clear()
+        self.attention_map_configs.clear()
         self._injection_processors.clear()
     
     def apply_patches(self, unet: UNet2DConditionModel) -> UNet2DConditionModel:
@@ -394,7 +538,7 @@ class UNetPatcher(BaseModelPatcher):
         Returns:
             Patched UNet model
         """
-        if not self.injection_configs:
+        if not self.injection_configs and not self.attention_map_configs:
             return unet
         
         # Store original processors for restoration
@@ -405,9 +549,12 @@ class UNetPatcher(BaseModelPatcher):
         if self._hook_handle is None:
             self._hook_handle = unet.register_forward_pre_hook(self._sigma_hook, with_kwargs=False)
         
-        for block_id, config in self.injection_configs.items():
+        all_block_ids = set(self.injection_configs.keys()) | set(self.attention_map_configs.keys())
+        
+        for block_id in all_block_ids:
             try:
                 # Find the diffusers path for this block
+                config = self.injection_configs.get(block_id, {'block': BlockIdentifier.from_string(block_id)})
                 block = config['block']
                 diffusers_path = self.block_mapper.map_to_diffusers_path(block)
                 
@@ -419,15 +566,20 @@ class UNetPatcher(BaseModelPatcher):
                     original_processor = getattr(attn_module, 'processor', AttnProcessor2_0())
                     self._original_processors[module_path] = original_processor
                     
+                    # Get configs for this specific block
+                    inj_config = self.injection_configs.get(block_id)
+                    attn_maps = self.attention_map_configs.get(block_id)
+                    
                     # Create custom processor
                     custom_processor = PromptInjectionProcessor(
                         original_processor=original_processor,
                         block_id=block_id,
-                        conditioning=config['conditioning'],
-                        weight=config['weight'],
-                        sigma_start=config['sigma_start'],
-                        sigma_end=config['sigma_end'],
-                        spatial_mask=config.get('spatial_mask')
+                        conditioning=inj_config.get('conditioning') if inj_config else None,
+                        weight=inj_config.get('weight', 1.0) if inj_config else 1.0,
+                        sigma_start=inj_config.get('sigma_start', 0.0) if inj_config else 0.0,
+                        sigma_end=inj_config.get('sigma_end', 1.0) if inj_config else 1.0,
+                        spatial_mask=inj_config.get('spatial_mask') if inj_config else None,
+                        attention_maps=attn_maps
                     )
                     
                     # Store processor for sigma updates

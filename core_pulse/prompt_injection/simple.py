@@ -8,6 +8,7 @@ from diffusers import DiffusionPipeline
 
 from .base import BasePromptInjector, PromptInjectionConfig
 from ..models.base import BlockIdentifier
+from ..utils.logger import logger
 
 
 class SimplePromptInjector(BasePromptInjector):
@@ -44,25 +45,32 @@ class SimplePromptInjector(BasePromptInjector):
             sigma_start: Start of injection window (default: 0.0)  
             sigma_end: End of injection window (default: 1.0)
         """
+        logger.info(f"Configuring simple injection for block(s) '{block}' with prompt '{prompt}'")
         self.clear_injections()
         
-        # Handle "all" keyword
-        if isinstance(block, str) and block.lower() == "all":
-            blocks = self.patcher.block_mapper.get_all_block_identifiers()
-        elif isinstance(block, list):
-            blocks = block
-        else:
-            blocks = [block]
-        
-        for b in blocks:
-            config = PromptInjectionConfig(
-                block=b,
-                prompt=prompt,
-                weight=weight,
-                sigma_start=sigma_start,
-                sigma_end=sigma_end
-            )
-            self.config = config  # Store last config for reference
+        try:
+            # Handle "all" keyword
+            if isinstance(block, str) and block.lower() == "all":
+                logger.debug("Expanding 'all' to all available blocks.")
+                blocks = self.patcher.block_mapper.get_all_block_identifiers()
+            elif isinstance(block, list):
+                blocks = block
+            else:
+                blocks = [block]
+            
+            logger.debug(f"Targeting {len(blocks)} block(s).")
+            for b in blocks:
+                config = PromptInjectionConfig(
+                    block=b,
+                    prompt=prompt,
+                    weight=weight,
+                    sigma_start=sigma_start,
+                    sigma_end=sigma_end
+                )
+                self.config = config  # Store last config for reference
+        except Exception as e:
+            logger.error(f"Failed to configure simple injection: {e}", exc_info=True)
+            raise
     
     def inject_prompt(self,
                      pipeline: DiffusionPipeline,
@@ -85,8 +93,13 @@ class SimplePromptInjector(BasePromptInjector):
         Returns:
             Modified pipeline
         """
-        self.configure_injections(block, prompt, weight, sigma_start, sigma_end)
-        return self.apply_to_pipeline(pipeline)
+        logger.debug("Performing one-call inject_prompt.")
+        try:
+            self.configure_injections(block, prompt, weight, sigma_start, sigma_end)
+            return self.apply_to_pipeline(pipeline)
+        except Exception as e:
+            logger.error(f"Failed during inject_prompt: {e}", exc_info=True)
+            raise
     
     def apply_to_pipeline(self, pipeline: DiffusionPipeline) -> DiffusionPipeline:
         """
@@ -99,21 +112,28 @@ class SimplePromptInjector(BasePromptInjector):
             Modified pipeline
         """
         if self.config is None:
-            raise ValueError("No injections configured. Call configure_injections first.")
+            msg = "No injections configured. Call configure_injections first."
+            logger.error(msg)
+            raise ValueError(msg)
         
-        # Encode the prompt
-        encoded_prompt = self.encode_prompt(self.config.prompt, pipeline)
-        
-        # Add injection to patcher
-        self.patcher.add_injection(
-            block=self.config.block,
-            conditioning=encoded_prompt,
-            weight=self.config.weight,
-            sigma_start=self.config.sigma_start,
-            sigma_end=self.config.sigma_end
-        )
-        
-        return super().apply_to_pipeline(pipeline)
+        logger.debug(f"Applying simple injection for block '{self.config.block}'")
+        try:
+            # Encode the prompt
+            encoded_prompt = self.encode_prompt(self.config.prompt, pipeline)
+            
+            # Add injection to patcher
+            self.patcher.add_injection(
+                block=self.config.block,
+                conditioning=encoded_prompt,
+                weight=self.config.weight,
+                sigma_start=self.config.sigma_start,
+                sigma_end=self.config.sigma_end
+            )
+            
+            return super().apply_to_pipeline(pipeline)
+        except Exception as e:
+            logger.error(f"Failed to apply simple injection to pipeline: {e}", exc_info=True)
+            raise
 
 
 class BlockSpecificInjector(SimplePromptInjector):
@@ -135,8 +155,15 @@ class BlockSpecificInjector(SimplePromptInjector):
         Returns:
             Modified pipeline
         """
-        middle_blocks = [f"middle:{i}" for i in self.patcher.block_mapper.blocks['middle']]
-        self.configure_injections(middle_blocks, prompt, weight)
+        logger.info(f"Injecting content prompt '{prompt}' with weight {weight}.")
+        try:
+            middle_blocks = [f"middle:{i}" for i in self.patcher.block_mapper.blocks.get('middle', [])]
+            if not middle_blocks:
+                logger.warning("No middle blocks found for content injection.")
+            self.configure_injections(middle_blocks, prompt, weight)
+        except Exception as e:
+            logger.error(f"Failed to inject content prompt: {e}", exc_info=True)
+            raise
     
     def inject_style(self, prompt: str, weight: float = 1.0):
         """
@@ -150,8 +177,15 @@ class BlockSpecificInjector(SimplePromptInjector):
         Returns:
             Modified pipeline
         """
-        style_blocks = [f"output:{i}" for i in self.patcher.block_mapper.blocks['output']]
-        self.configure_injections(style_blocks, prompt, weight)
+        logger.info(f"Injecting style prompt '{prompt}' with weight {weight}.")
+        try:
+            style_blocks = [f"output:{i}" for i in self.patcher.block_mapper.blocks.get('output', [])]
+            if not style_blocks:
+                logger.warning("No output blocks found for style injection.")
+            self.configure_injections(style_blocks, prompt, weight)
+        except Exception as e:
+            logger.error(f"Failed to inject style prompt: {e}", exc_info=True)
+            raise
     
     def inject_composition(self, prompt: str, weight: float = 1.0):
         """
@@ -165,8 +199,15 @@ class BlockSpecificInjector(SimplePromptInjector):
         Returns:
             Modified pipeline
         """
-        composition_blocks = [f"input:{i}" for i in self.patcher.block_mapper.blocks['input']]
-        self.configure_injections(composition_blocks, prompt, weight)
+        logger.info(f"Injecting composition prompt '{prompt}' with weight {weight}.")
+        try:
+            composition_blocks = [f"input:{i}" for i in self.patcher.block_mapper.blocks.get('input', [])]
+            if not composition_blocks:
+                logger.warning("No input blocks found for composition injection.")
+            self.configure_injections(composition_blocks, prompt, weight)
+        except Exception as e:
+            logger.error(f"Failed to inject composition prompt: {e}", exc_info=True)
+            raise
 
 
 # Convenience functions for quick usage

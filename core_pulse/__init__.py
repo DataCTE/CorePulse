@@ -8,7 +8,7 @@ including prompt injection, block-level conditioning, and other advanced techniq
 __version__ = "0.1.0"
 __author__ = "CorePulse Contributors"
 
-from .prompt_injection import SimplePromptInjector, AdvancedPromptInjector
+from .prompt_injection import SimplePromptInjector, AdvancedPromptInjector, AttentionMapInjector
 from .models import UNetPatcher
 from .prompt_injection.masking import MaskedPromptInjector
 from .prompt_injection.spatial import (
@@ -30,6 +30,7 @@ from .prompt_injection.spatial import (
 __all__ = [
     "SimplePromptInjector",
     "AdvancedPromptInjector", 
+    "AttentionMapInjector",
     "UNetPatcher",
     "MaskedPromptInjector",
     "RegionalPromptInjector",

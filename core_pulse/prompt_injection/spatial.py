@@ -14,6 +14,7 @@ from PIL import Image
 
 from .masking import MaskedPromptInjector
 from ..models.base import BlockIdentifier
+from ..utils.logger import logger
 
 
 class MaskFactory:
@@ -30,38 +31,47 @@ class MaskFactory:
         """
         Create a mask from a predefined shape.
         """
-        height, width = image_size[1], image_size[0]
-        mask = torch.zeros((height, width), dtype=torch.float32)
-        
-        shape_type = shape_type.lower()
+        logger.debug(f"Creating mask from shape '{shape_type}' with size {image_size} and params {params}")
+        try:
+            height, width = image_size[1], image_size[0]
+            mask = torch.zeros((height, width), dtype=torch.float32)
+            
+            shape_type = shape_type.lower()
 
-        if shape_type == 'rectangle':
-            x, y, w, h = params['x'], params['y'], params['width'], params['height']
-            x1, y1 = max(0, x), max(0, y)
-            x2, y2 = min(width, x + w), min(height, y + h)
-            mask[y1:y2, x1:x2] = 1.0
-        
-        elif shape_type == 'circle':
-            cx, cy, radius = params['cx'], params['cy'], params['radius']
-            y_coords = torch.arange(height)
-            x_coords = torch.arange(width)
-            y_grid, x_grid = torch.meshgrid(y_coords, x_coords, indexing='ij')
-            dist = torch.sqrt((x_grid - cx)**2 + (y_grid - cy)**2)
-            mask[dist <= radius] = 1.0
+            if shape_type == 'rectangle':
+                x, y, w, h = params['x'], params['y'], params['width'], params['height']
+                x1, y1 = max(0, x), max(0, y)
+                x2, y2 = min(width, x + w), min(height, y + h)
+                mask[y1:y2, x1:x2] = 1.0
             
-        elif shape_type == 'ellipse':
-            cx, cy = params['cx'], params['cy']
-            w, h = params['width'], params['height']
-            y_coords = torch.arange(height)
-            x_coords = torch.arange(width)
-            y_grid, x_grid = torch.meshgrid(y_coords, x_coords, indexing='ij')
-            ellipse_mask = ((x_grid - cx) / (w / 2))**2 + ((y_grid - cy) / (h / 2))**2 <= 1
-            mask[ellipse_mask] = 1.0
-            
-        else:
-            raise ValueError(f"Unsupported shape_type: {shape_type}")
-            
-        return mask
+            elif shape_type == 'circle':
+                cx, cy, radius = params['cx'], params['cy'], params['radius']
+                y_coords = torch.arange(height)
+                x_coords = torch.arange(width)
+                y_grid, x_grid = torch.meshgrid(y_coords, x_coords, indexing='ij')
+                dist = torch.sqrt((x_grid - cx)**2 + (y_grid - cy)**2)
+                mask[dist <= radius] = 1.0
+                
+            elif shape_type == 'ellipse':
+                cx, cy = params['cx'], params['cy']
+                w, h = params['width'], params['height']
+                y_coords = torch.arange(height)
+                x_coords = torch.arange(width)
+                y_grid, x_grid = torch.meshgrid(y_coords, x_coords, indexing='ij')
+                ellipse_mask = ((x_grid - cx) / (w / 2))**2 + ((y_grid - cy) / (h / 2))**2 <= 1
+                mask[ellipse_mask] = 1.0
+                
+            else:
+                raise ValueError(f"Unsupported shape_type: {shape_type}")
+                
+            logger.debug(f"Created mask with shape {mask.shape} and mean value {mask.mean().item():.4f}")
+            return mask
+        except KeyError as e:
+            logger.error(f"Missing required parameter for shape '{shape_type}': {e}", exc_info=True)
+            raise
+        except Exception as e:
+            logger.error(f"Failed to create mask from shape '{shape_type}': {e}", exc_info=True)
+            raise
 
     @staticmethod
     def from_image(image_path: str,
@@ -69,31 +79,48 @@ class MaskFactory:
         """
         Load a mask from an image file.
         """
+        logger.debug(f"Loading mask from image: {image_path}")
         try:
             mask_image = Image.open(image_path).convert('L')
         except FileNotFoundError:
-            raise FileNotFoundError(f"Mask image not found at: {image_path}")
+            logger.error(f"Mask image not found at: {image_path}")
+            raise
+        except Exception as e:
+            logger.error(f"Failed to load mask image '{image_path}': {e}", exc_info=True)
+            raise
 
         if image_size:
+            logger.debug(f"Resizing mask image to {image_size}")
             mask_image = mask_image.resize(image_size, Image.LANCZOS)
             
         mask_np = np.array(mask_image).astype(np.float32) / 255.0
-        return torch.from_numpy(mask_np)
+        mask = torch.from_numpy(mask_np)
+        logger.debug(f"Loaded mask with shape {mask.shape} and mean value {mask.mean().item():.4f}")
+        return mask
 
     @staticmethod
     def gaussian_blur(mask: torch.Tensor, kernel_size: int = 5, sigma: float = 1.0) -> torch.Tensor:
         """
         Apply a Gaussian blur to soften the edges of a mask.
         """
-        if mask.ndim == 2:
-            mask = mask.unsqueeze(0).unsqueeze(0)
-        
-        if kernel_size % 2 == 0:
-            kernel_size += 1
+        logger.debug(f"Applying Gaussian blur with kernel_size={kernel_size}, sigma={sigma}")
+        try:
+            if mask.ndim == 2:
+                mask_unsqueezed = mask.unsqueeze(0).unsqueeze(0)
+            else:
+                mask_unsqueezed = mask
+
+            if kernel_size % 2 == 0:
+                kernel_size += 1
+                
+            blurred_mask = F.gaussian_blur(mask_unsqueezed, kernel_size=[kernel_size, kernel_size], sigma=[sigma, sigma])
             
-        blurred_mask = F.gaussian_blur(mask, kernel_size=[kernel_size, kernel_size], sigma=[sigma, sigma])
-        
-        return blurred_mask.squeeze(0).squeeze(0)
+            result = blurred_mask.squeeze(0).squeeze(0)
+            logger.debug(f"Blurred mask mean value: {result.mean().item():.4f}")
+            return result
+        except Exception as e:
+            logger.error(f"Failed to apply Gaussian blur: {e}", exc_info=True)
+            raise
 
     @staticmethod
     def gradient(gradient_type: str,
@@ -102,49 +129,55 @@ class MaskFactory:
         """
         Create a linear or radial gradient mask.
         """
-        height, width = image_size[1], image_size[0]
-        gradient_type = gradient_type.lower()
-        
-        if gradient_type == 'linear':
-            start_val = params.get('start_val', 0.0)
-            end_val = params.get('end_val', 1.0)
-            direction = params.get('direction', 'horizontal')
+        logger.debug(f"Creating '{gradient_type}' gradient mask for size {image_size}")
+        try:
+            height, width = image_size[1], image_size[0]
+            gradient_type = gradient_type.lower()
             
-            if direction == 'horizontal':
-                grad_vector = torch.linspace(start_val, end_val, width)
-                return grad_vector.repeat(height, 1)
-            elif direction == 'vertical':
-                grad_vector = torch.linspace(start_val, end_val, height)
-                return grad_vector.unsqueeze(-1).repeat(1, width)
+            if gradient_type == 'linear':
+                start_val = params.get('start_val', 0.0)
+                end_val = params.get('end_val', 1.0)
+                direction = params.get('direction', 'horizontal')
+                
+                if direction == 'horizontal':
+                    grad_vector = torch.linspace(start_val, end_val, width)
+                    return grad_vector.repeat(height, 1)
+                elif direction == 'vertical':
+                    grad_vector = torch.linspace(start_val, end_val, height)
+                    return grad_vector.unsqueeze(-1).repeat(1, width)
+                else:
+                    raise ValueError(f"Unsupported linear gradient direction: {direction}")
+
+            elif gradient_type == 'radial':
+                cx = params.get('cx', width // 2)
+                cy = params.get('cy', height // 2)
+                radius = params.get('radius', min(width, height) / 2)
+                start_val = params.get('start_val', 1.0)
+                end_val = params.get('end_val', 0.0)
+                
+                y_coords = torch.arange(height)
+                x_coords = torch.arange(width)
+                y_grid, x_grid = torch.meshgrid(y_coords, x_coords, indexing='ij')
+                dist = torch.sqrt((x_grid - cx)**2 + (y_grid - cy)**2)
+                
+                grad = dist / radius
+                grad = torch.clamp(grad, 0, 1)
+                
+                grad = start_val + (end_val - start_val) * grad
+                return torch.clamp(grad, 0, 1)
+
             else:
-                raise ValueError(f"Unsupported linear gradient direction: {direction}")
-
-        elif gradient_type == 'radial':
-            cx = params.get('cx', width // 2)
-            cy = params.get('cy', height // 2)
-            radius = params.get('radius', min(width, height) / 2)
-            start_val = params.get('start_val', 1.0)
-            end_val = params.get('end_val', 0.0)
-            
-            y_coords = torch.arange(height)
-            x_coords = torch.arange(width)
-            y_grid, x_grid = torch.meshgrid(y_coords, x_coords, indexing='ij')
-            dist = torch.sqrt((x_grid - cx)**2 + (y_grid - cy)**2)
-            
-            grad = dist / radius
-            grad = torch.clamp(grad, 0, 1)
-            
-            grad = start_val + (end_val - start_val) * grad
-            return torch.clamp(grad, 0, 1)
-
-        else:
-            raise ValueError(f"Unsupported gradient_type: {gradient_type}")
+                raise ValueError(f"Unsupported gradient_type: {gradient_type}")
+        except Exception as e:
+            logger.error(f"Failed to create gradient mask: {e}", exc_info=True)
+            raise
 
     @staticmethod
     def invert(mask: torch.Tensor) -> torch.Tensor:
         """
         Invert a mask (1.0 - mask).
         """
+        logger.debug("Inverting mask.")
         return 1.0 - mask
 
     @staticmethod
@@ -154,15 +187,20 @@ class MaskFactory:
         """
         Combine two masks using a boolean-like operation.
         """
-        operation = operation.lower()
-        if operation == 'add':
-            return torch.max(mask1, mask2)
-        elif operation == 'subtract':
-            return torch.clamp(mask1 - mask2, 0, 1)
-        elif operation == 'multiply':
-            return torch.min(mask1, mask2)
-        else:
-            raise ValueError(f"Unsupported operation: {operation}")
+        logger.debug(f"Combining masks with operation: '{operation}'")
+        try:
+            operation = operation.lower()
+            if operation == 'add':
+                return torch.max(mask1, mask2)
+            elif operation == 'subtract':
+                return torch.clamp(mask1 - mask2, 0, 1)
+            elif operation == 'multiply':
+                return torch.min(mask1, mask2)
+            else:
+                raise ValueError(f"Unsupported operation: {operation}")
+        except Exception as e:
+            logger.error(f"Failed to combine masks with operation '{operation}': {e}", exc_info=True)
+            raise
 
 
 class RegionalPromptInjector(MaskedPromptInjector):
@@ -173,10 +211,17 @@ class RegionalPromptInjector(MaskedPromptInjector):
     def __init__(self, pipeline: DiffusionPipeline):
         super().__init__(pipeline)
         
-        # Determine attention resolution from the UNet's down block types
-        # This is a heuristic that works for SD1.5 and SDXL
-        num_down_blocks = len(pipeline.unet.config['down_block_types'])
-        self.attention_resolution = pipeline.unet.sample_size // (2 ** (num_down_blocks - 1))
+        try:
+            # Determine attention resolution from the UNet's down block types
+            # This is a heuristic that works for SD1.5 and SDXL
+            num_down_blocks = len(pipeline.unet.config['down_block_types'])
+            self.attention_resolution = pipeline.unet.sample_size // (2 ** (num_down_blocks - 1))
+            logger.info(f"Regional injector initialized with attention resolution: {self.attention_resolution}")
+        except Exception as e:
+            logger.error(f"Failed to determine attention resolution: {e}", exc_info=True)
+            # Fallback to a default value
+            self.attention_resolution = 64
+            logger.warning(f"Could not determine attention resolution, falling back to default: {self.attention_resolution}")
 
     def add_regional_injection(self,
                                block: Union[str, BlockIdentifier],
@@ -196,22 +241,30 @@ class RegionalPromptInjector(MaskedPromptInjector):
             sigma_start: Start of the injection window in the diffusion process.
             sigma_end: End of the injection window.
         """
-        # Resize mask to the attention resolution and flatten
-        attention_mask = torch.nn.functional.interpolate(
-            mask.unsqueeze(0).unsqueeze(0),
-            size=(self.attention_resolution, self.attention_resolution),
-            mode='bilinear',
-            align_corners=False
-        ).squeeze(0).squeeze(0).flatten()
+        logger.info(f"Adding regional injection for block '{block}' with prompt '{prompt[:30]}...'")
+        logger.debug(f"Original mask shape: {mask.shape}, mean: {mask.mean().item():.4f}")
+        
+        try:
+            # Resize mask to the attention resolution and flatten
+            attention_mask = torch.nn.functional.interpolate(
+                mask.unsqueeze(0).unsqueeze(0),
+                size=(self.attention_resolution, self.attention_resolution),
+                mode='bilinear',
+                align_corners=False
+            ).squeeze(0).squeeze(0).flatten()
+            logger.debug(f"Resized attention mask to shape: {attention_mask.shape}, mean: {attention_mask.mean().item():.4f}")
 
-        self.add_injection(
-            block=block,
-            prompt=prompt,
-            weight=weight,
-            sigma_start=sigma_start,
-            sigma_end=sigma_end,
-            spatial_mask=attention_mask
-        )
+            self.add_injection(
+                block=block,
+                prompt=prompt,
+                weight=weight,
+                sigma_start=sigma_start,
+                sigma_end=sigma_end,
+                spatial_mask=attention_mask
+            )
+        except Exception as e:
+            logger.error(f"Failed to add regional injection for block '{block}': {e}", exc_info=True)
+            raise
 
 
 # Helper functions for creating common spatial regions
