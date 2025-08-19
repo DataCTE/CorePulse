@@ -10,15 +10,21 @@ from core_pulse.models.base import BlockIdentifier
 # --- Fixtures ---
 
 @pytest.fixture
-def injector():
-    """Return an AdvancedPromptInjector with a mock pipeline."""
-    injector = AdvancedPromptInjector(model_type="sdxl")
-    injector.patcher.block_mapper.blocks = {
-        'input': [4, 5, 7, 8],
-        'middle': [0],
-        'output': [0, 1, 2] # Simplified for testing
+def mock_pipeline():
+    """Return a mock pipeline for testing."""
+    pipeline = MagicMock()
+    pipeline.unet = MagicMock()
+    pipeline.unet.config = {
+        "down_block_types": ["DownBlock2D", "CrossAttnDownBlock2D", "CrossAttnDownBlock2D"],
+        "up_block_types": ["CrossAttnUpBlock2D", "CrossAttnUpBlock2D", "UpBlock2D"],
+        "mid_block_type": "UNetMidBlock2DCrossAttn"
     }
-    return injector
+    return pipeline
+
+@pytest.fixture
+def injector(mock_pipeline):
+    """Return an AdvancedPromptInjector with a mock pipeline."""
+    return AdvancedPromptInjector(mock_pipeline)
 
 @pytest.fixture(scope="session")
 def sd15_pipeline():
@@ -108,7 +114,7 @@ def test_advanced_injector_influences_output(sd15_pipeline):
     base_image = np.array(base_image_pil)
 
     # Generate injected image
-    injector = AdvancedPromptInjector(model_type="sd15")
+    injector = AdvancedPromptInjector(sd15_pipeline)
     injector.add_injection("all", "in a surrealist style", weight=2.0)
     
     generator.manual_seed(42) # Reset seed
@@ -142,7 +148,7 @@ def test_advanced_injector_influences_output_sdxl(sdxl_pipeline):
     base_image = np.array(base_image_pil)
 
     # Generate injected image
-    injector = AdvancedPromptInjector(model_type="sdxl")
+    injector = AdvancedPromptInjector(sdxl_pipeline)
     injector.add_injection("all", "in a surrealist style", weight=2.0)
     
     generator.manual_seed(42) # Reset seed

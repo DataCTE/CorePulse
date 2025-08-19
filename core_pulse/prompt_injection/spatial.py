@@ -170,15 +170,13 @@ class RegionalPromptInjector(MaskedPromptInjector):
     Advanced prompt injector with spatial masking capabilities.
     """
     
-    def __init__(self, model_type: str = "sdxl"):
-        super().__init__(model_type)
+    def __init__(self, pipeline: DiffusionPipeline):
+        super().__init__(pipeline)
         
-        if model_type.lower() == "sd15":
-            self.attention_resolution = 64
-        elif model_type.lower() == "sdxl":
-            self.attention_resolution = 128
-        else:
-            raise ValueError(f"Unsupported model type: {model_type}")
+        # Determine attention resolution from the UNet's down block types
+        # This is a heuristic that works for SD1.5 and SDXL
+        num_down_blocks = len(pipeline.unet.config['down_block_types'])
+        self.attention_resolution = pipeline.unet.sample_size // (2 ** (num_down_blocks - 1))
 
     def add_regional_injection(self,
                                block: Union[str, BlockIdentifier],

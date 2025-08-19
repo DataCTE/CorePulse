@@ -11,7 +11,7 @@ from typing import Dict, List, Union, Optional, Tuple, Any
 from diffusers import DiffusionPipeline
 from transformers import PreTrainedTokenizer
 
-from .base import BasePromptInjector, PromptInjectionConfig
+from .base import BasePromptInjector
 from .advanced import AdvancedPromptInjector
 from ..models.base import BlockIdentifier
 
@@ -226,17 +226,17 @@ class MaskedPromptInjector(AdvancedPromptInjector):
     Advanced prompt injector with token-level masking capabilities.
     """
     
-    def __init__(self, model_type: str = "sdxl"):
+    def __init__(self, pipeline: DiffusionPipeline):
         """
         Initialize masked prompt injector.
         
         Args:
-            model_type: Model type ("sdxl" or "sd15")
+            pipeline: The diffusers pipeline to inject into.
         """
-        super().__init__(model_type)
+        super().__init__(pipeline)
         self.masked_configs: Dict[str, Dict[str, Any]] = {}
-        self._token_analyzer: Optional[TokenAnalyzer] = None
-        self._masked_encoder: Optional[MaskedPromptEncoder] = None
+        self._token_analyzer = TokenAnalyzer(pipeline.tokenizer)
+        self._masked_encoder = MaskedPromptEncoder(self)
         
     def add_masked_injection(self, 
                            block: Union[str, BlockIdentifier],

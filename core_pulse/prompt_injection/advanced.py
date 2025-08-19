@@ -18,14 +18,8 @@ class AdvancedPromptInjector(BasePromptInjector):
     and batch processing of injection configurations.
     """
     
-    def __init__(self, model_type: str = "sdxl"):
-        """
-        Initialize advanced prompt injector.
-        
-        Args:
-            model_type: Model type ("sdxl" or "sd15")
-        """
-        super().__init__(model_type)
+    def __init__(self, pipeline: DiffusionPipeline):
+        super().__init__(pipeline)
         self.configs: Dict[BlockIdentifier, PromptInjectionConfig] = {}
     
     def configure_injections(self, 
@@ -80,23 +74,15 @@ class AdvancedPromptInjector(BasePromptInjector):
             sigma_end: End of injection window
             spatial_mask: Optional spatial mask for regional control
         """
-        # Handle "all" keyword
         if isinstance(block, str) and block.lower() == "all":
             all_blocks = self.patcher.block_mapper.get_all_block_identifiers()
             for block_id_str in all_blocks:
-                config = PromptInjectionConfig(
-                    block=block_id_str,
-                    prompt=prompt,
-                    weight=weight,
-                    sigma_start=sigma_start,
-                    sigma_end=sigma_end,
-                    spatial_mask=spatial_mask
-                )
-                block_id = BlockIdentifier.from_string(block_id_str)
-                self.configs[block_id] = config
-            return
-        
-        # Handle single block
+                self._add_single_injection(block_id_str, prompt, weight, sigma_start, sigma_end, spatial_mask)
+        else:
+            self._add_single_injection(block, prompt, weight, sigma_start, sigma_end, spatial_mask)
+
+    def _add_single_injection(self, block, prompt, weight, sigma_start, sigma_end, spatial_mask):
+        """Helper to add a single injection config."""
         config = PromptInjectionConfig(
             block=block,
             prompt=prompt,
@@ -105,7 +91,6 @@ class AdvancedPromptInjector(BasePromptInjector):
             sigma_end=sigma_end,
             spatial_mask=spatial_mask
         )
-        
         block_id = BlockIdentifier.from_string(block) if isinstance(block, str) else block
         self.configs[block_id] = config
     
@@ -271,54 +256,14 @@ class MultiPromptInjector(AdvancedPromptInjector):
             content_weight: Weight for content injection
             style_weight: Weight for style injection
         """
+        # Get all available middle and output blocks for the current model
+        middle_blocks = self.patcher.block_mapper.blocks.get('middle', [])
+        output_blocks = self.patcher.block_mapper.blocks.get('output', [])
+
         # Configure content blocks (middle)
-        if self.model_type == "sdxl":
-            self.add_injection("middle:0", content_prompt, content_weight)
-        else:  # sd15
-            for i in [0, 1]:
-                self.add_injection(f"middle:{i}", content_prompt, content_weight)
+        for i in middle_blocks:
+            self.add_injection(f"middle:{i}", content_prompt, content_weight)
         
-        # Configure style blocks (output)  
-        if self.model_type == "sdxl":
-            for i in [0, 1]:
-                self.add_injection(f"output:{i}", style_prompt, style_weight)
-        else:  # sd15
-            for i in [0, 1, 2]:
-                self.add_injection(f"output:{i}", style_prompt, style_weight)
-
-
-# Factory functions for common use cases
-def create_content_style_injector(model_type: str = "sdxl") -> MultiPromptInjector:
-    """
-    Create an injector preconfigured for content/style separation.
-    
-    Args:
-        model_type: Model type ("sdxl" or "sd15")
-        
-    Returns:
-        Configured MultiPromptInjector
-    """
-    return MultiPromptInjector(model_type)
-
-
-def create_location_injector(locations_str: str, 
-                           prompt: str,
-                           model_type: str = "sdxl",
-                           sigma_start: float = 0.0,
-                           sigma_end: float = 1.0) -> LocationBasedInjector:
-    """
-    Create and configure a location-based injector.
-    
-    Args:
-        locations_str: Location string in "block:index,weight" format
-        prompt: Prompt to inject
-        model_type: Model type ("sdxl" or "sd15") 
-        sigma_start: Start of injection window
-        sigma_end: End of injection window
-        
-    Returns:
-        Configured LocationBasedInjector
-    """
-    injector = LocationBasedInjector(model_type)
-    injector.configure_from_locations(locations_str, prompt, sigma_start, sigma_end)
-    return injector
+        # Configure style blocks (output)
+        for i in output_blocks:
+            self.add_injection(f"output:{i}", style_prompt, style_weight)

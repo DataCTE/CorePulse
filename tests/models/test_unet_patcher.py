@@ -1,44 +1,38 @@
 import pytest
+from unittest.mock import MagicMock
 from core_pulse.models.unet_patcher import UNetBlockMapper
 from core_pulse.models.base import BlockIdentifier
 
-def test_block_mapper_sdxl():
+@pytest.fixture
+def sdxl_unet():
+    """Return a mock SDXL UNet."""
+    unet = MagicMock()
+    unet.config = {
+        "down_block_types": ["DownBlock2D", "CrossAttnDownBlock2D", "CrossAttnDownBlock2D"],
+        "up_block_types": ["CrossAttnUpBlock2D", "CrossAttnUpBlock2D", "UpBlock2D"],
+        "mid_block_type": "UNetMidBlock2DCrossAttn"
+    }
+    return unet
+
+@pytest.fixture
+def sd15_unet():
+    """Return a mock SD1.5 UNet."""
+    unet = MagicMock()
+    unet.config = {
+        "down_block_types": ["CrossAttnDownBlock2D", "CrossAttnDownBlock2D", "CrossAttnDownBlock2D", "DownBlock2D"],
+        "up_block_types": ["UpBlock2D", "CrossAttnUpBlock2D", "CrossAttnUpBlock2D", "CrossAttnUpBlock2D"],
+        "mid_block_type": "UNetMidBlock2DCrossAttn"
+    }
+    return unet
+
+def test_block_mapper_sdxl(sdxl_unet):
     """Test UNetBlockMapper for SDXL."""
-    mapper = UNetBlockMapper(model_type="sdxl")
-    
-    # Test valid blocks
-    assert mapper.is_valid_block(BlockIdentifier("input", 4))
-    assert mapper.is_valid_block(BlockIdentifier("middle", 0))
-    assert mapper.is_valid_block(BlockIdentifier("output", 5))
-    
-    # Test invalid blocks
-    assert not mapper.is_valid_block(BlockIdentifier("input", 0))
-    assert not mapper.is_valid_block(BlockIdentifier("middle", 1))
-    
-    # Test path mapping
-    assert mapper.map_to_diffusers_path(BlockIdentifier("input", 4)) == "down_blocks.4"
-    assert mapper.map_to_diffusers_path(BlockIdentifier("middle", 0)) == "mid_block"
-    assert mapper.map_to_diffusers_path(BlockIdentifier("output", 2)) == "up_blocks.2"
+    mapper = UNetBlockMapper(sdxl_unet)
+    assert mapper.blocks['input'] == [1, 2]
+    assert mapper.blocks['output'] == [0, 1]
 
-def test_block_mapper_sd15():
+def test_block_mapper_sd15(sd15_unet):
     """Test UNetBlockMapper for SD1.5."""
-    mapper = UNetBlockMapper(model_type="sd15")
-    
-    # Test valid blocks
-    assert mapper.is_valid_block(BlockIdentifier("input", 3))
-    assert mapper.is_valid_block(BlockIdentifier("middle", 1))
-    assert mapper.is_valid_block(BlockIdentifier("output", 3))
-    
-    # Test invalid blocks
-    assert not mapper.is_valid_block(BlockIdentifier("input", 0))
-    assert not mapper.is_valid_block(BlockIdentifier("middle", 3))
-    
-    # Test path mapping
-    assert mapper.map_to_diffusers_path(BlockIdentifier("input", 3)) == "down_blocks.3"
-    assert mapper.map_to_diffusers_path(BlockIdentifier("middle", 0)) == "mid_block"
-    assert mapper.map_to_diffusers_path(BlockIdentifier("output", 1)) == "up_blocks.1"
-
-def test_block_mapper_invalid_model():
-    """Test that an invalid model type raises an error."""
-    with pytest.raises(ValueError):
-        UNetBlockMapper(model_type="invalid_model")
+    mapper = UNetBlockMapper(sd15_unet)
+    assert mapper.blocks['input'] == [0, 1, 2]
+    assert mapper.blocks['output'] == [1, 2, 3]

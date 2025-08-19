@@ -6,6 +6,7 @@ from abc import ABC, abstractmethod
 from typing import Any, Dict, Optional, Callable
 import torch
 from diffusers import DiffusionPipeline
+from dataclasses import dataclass
 
 
 class BaseModelPatcher(ABC):

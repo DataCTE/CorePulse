@@ -48,17 +48,17 @@ def detect_model_type(pipeline: DiffusionPipeline) -> str:
     return "sdxl"
 
 
-def get_available_blocks(model_type: str = "sdxl") -> Dict[str, List[int]]:
+def get_available_blocks(pipeline: DiffusionPipeline) -> Dict[str, List[int]]:
     """
     Get available blocks for a model type.
     
     Args:
-        model_type: Model type ("sdxl" or "sd15")
+        pipeline: The diffusion pipeline to inspect.
         
     Returns:
         Dictionary mapping block types to available indices
     """
-    mapper = UNetBlockMapper(model_type)
+    mapper = UNetBlockMapper(pipeline.unet)
     return mapper.get_valid_blocks()
 
 
@@ -74,12 +74,11 @@ def create_quick_injector(pipeline: DiffusionPipeline,
     Returns:
         Configured prompt injector
     """
-    model_type = detect_model_type(pipeline)
     
     if interface.lower() == "simple":
-        return SimplePromptInjector(model_type)
+        return SimplePromptInjector(pipeline)
     elif interface.lower() == "advanced":
-        return AdvancedPromptInjector(model_type)
+        return AdvancedPromptInjector(pipeline)
     else:
         raise ValueError(f"Unknown interface type: {interface}")
 
@@ -163,8 +162,7 @@ def demonstrate_content_style_split(pipeline: DiffusionPipeline,
     """
     from ..prompt_injection.advanced import MultiPromptInjector
     
-    model_type = detect_model_type(pipeline)
-    injector = MultiPromptInjector(model_type)
+    injector = MultiPromptInjector(pipeline)
     
     injector.add_content_style_split(
         content_prompt=content_prompt,
@@ -184,19 +182,19 @@ def demonstrate_content_style_split(pipeline: DiffusionPipeline,
 
 
 def validate_injection_config(config: Dict[str, Any], 
-                            model_type: str = "sdxl") -> List[str]:
+                            pipeline: DiffusionPipeline) -> List[str]:
     """
     Validate an injection configuration and return any errors.
     
     Args:
         config: Injection configuration to validate
-        model_type: Model type to validate against
+        pipeline: Pipeline to validate against
         
     Returns:
         List of error messages (empty if valid)
     """
     errors = []
-    mapper = UNetBlockMapper(model_type)
+    mapper = UNetBlockMapper(pipeline.unet)
     
     required_fields = ["block", "prompt"]
     for field in required_fields:
@@ -208,7 +206,7 @@ def validate_injection_config(config: Dict[str, Any],
             from ..models.base import BlockIdentifier
             block = BlockIdentifier.from_string(config["block"])
             if not mapper.is_valid_block(block):
-                errors.append(f"Invalid block for {model_type}: {config['block']}")
+                errors.append(f"Invalid block for {detect_model_type(pipeline)}: {config['block']}")
         except ValueError as e:
             errors.append(f"Invalid block format: {e}")
     

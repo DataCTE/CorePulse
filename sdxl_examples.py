@@ -70,10 +70,10 @@ def regional_injection_demonstration_sdxl():
     print("   - Left Region: Crystal castle")
     print("   - Right Region: Fire-breathing dragon")
     
-    # Reset generator for fair comparison
     generator = torch.Generator(device=device).manual_seed(seed)
     
-    injector = RegionalPromptInjector(model_type="sdxl")
+    # NEW: Initialize injector with the pipeline
+    injector = RegionalPromptInjector(pipeline)
     
     # Define the regions and their corresponding prompts
     

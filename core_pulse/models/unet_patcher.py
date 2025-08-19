@@ -10,41 +10,45 @@ import torch
 from typing import Dict, Optional, Union, List, Tuple, Any, Callable
 from diffusers import UNet2DConditionModel
 from diffusers.models.attention_processor import Attention, AttnProcessor2_0
+from diffusers.schedulers.scheduling_utils import SchedulerMixin
 from .base import BaseModelPatcher, BlockIdentifier
 
 
 class UNetBlockMapper:
     """
-    Maps between ComfyUI-style block identifiers and diffusers UNet structure.
+    Dynamically maps ComfyUI-style block identifiers to the structure of a
+    given diffusers UNet model by inspecting its configuration.
     """
     
-    # Block mappings for different model architectures
-    SDXL_BLOCKS = {
-        'input': [1, 2],
-        'middle': [0],
-        'output': [0, 1]
-    }
-    
-    SD15_BLOCKS = {
-        'input': [3],  # SD 1.5 has input blocks but fewer cross-attention layers
-        'middle': [0, 1, 2],
-        'output': [0, 1, 2, 3]  # SD 1.5 has output blocks 0-3 with cross-attention
-    }
-    
-    def __init__(self, model_type: str = "sdxl"):
+    def __init__(self, unet: UNet2DConditionModel):
         """
-        Initialize block mapper.
+        Initialize the block mapper by inspecting the UNet's config.
         
         Args:
-            model_type: Either "sdxl" or "sd15"
+            unet: The UNet2DConditionModel to map.
         """
-        self.model_type = model_type.lower()
-        if self.model_type == "sdxl":
-            self.blocks = self.SDXL_BLOCKS
-        elif self.model_type == "sd15":
-            self.blocks = self.SD15_BLOCKS
-        else:
-            raise ValueError(f"Unsupported model type: {model_type}")
+        self.unet_config = unet.config
+        self.blocks = self._build_block_map()
+
+    def _build_block_map(self) -> Dict[str, List[int]]:
+        """Build the block map from the UNet's configuration."""
+        block_map = {'input': [], 'middle': [], 'output': []}
+        
+        # Input blocks
+        for i, block_type in enumerate(self.unet_config.get("down_block_types", [])):
+            if "CrossAttn" in block_type:
+                block_map['input'].append(i)
+        
+        # Middle block (always has cross-attention)
+        if self.unet_config.get("mid_block_type", None) and "CrossAttn" in self.unet_config["mid_block_type"]:
+            block_map['middle'].append(0)
+            
+        # Output blocks
+        for i, block_type in enumerate(self.unet_config.get("up_block_types", [])):
+            if "CrossAttn" in block_type:
+                block_map['output'].append(i)
+                
+        return block_map
     
     def get_valid_blocks(self) -> Dict[str, List[int]]:
         """Get all valid blocks for this model type."""
@@ -74,7 +78,7 @@ class UNetBlockMapper:
             String path to the module in diffusers UNet
         """
         if not self.is_valid_block(block):
-            raise ValueError(f"Invalid block for {self.model_type}: {block}")
+            raise ValueError(f"Invalid block for {self.unet_config.model_type}: {block}")
         
         if block.block_type == "input":
             return f"down_blocks.{block.block_index}"
@@ -106,6 +110,7 @@ class PromptInjectionProcessor:
         self.sigma_start = sigma_start  # Higher values (more noise)
         self.sigma_end = sigma_end      # Lower values (less noise)
         self.spatial_mask = spatial_mask  # Optional spatial mask for regional control
+        self.projection_layer = None # For handling mismatched dimensions
         
         # Parse block info
         if ':' in block_id:
@@ -193,15 +198,24 @@ class PromptInjectionProcessor:
             result = encoder_hidden_states.clone()
             # Ensure injected conditioning matches the shape of the target
             if injected_conditioning.shape[-1] != result.shape[-1]:
-                # This can happen if injecting SD1.5 conditioning into an SDXL model or vice-versa
-                # We will simply not inject in this case to avoid crashing.
-                # A more sophisticated solution could involve projection.
-                return result
+                if self.projection_layer is None:
+                    source_dim = injected_conditioning.shape[-1]
+                    target_dim = result.shape[-1]
+                    self.projection_layer = torch.nn.Linear(source_dim, target_dim)
+                    self.projection_layer.to(device=result.device, dtype=result.dtype)
+                injected_conditioning = self.projection_layer(injected_conditioning)
 
-            result[1] = injected_conditioning[0] * self.weight
+            result[1] = injected_conditioning[0] * torch.tensor(self.weight, device=injected_conditioning.device, dtype=injected_conditioning.dtype)
         else:
             # Single batch: full replacement
-            result = injected_conditioning * self.weight
+            if injected_conditioning.shape[-1] != encoder_hidden_states.shape[-1]:
+                if self.projection_layer is None:
+                    source_dim = injected_conditioning.shape[-1]
+                    target_dim = encoder_hidden_states.shape[-1]
+                    self.projection_layer = torch.nn.Linear(source_dim, target_dim)
+                    self.projection_layer.to(device=encoder_hidden_states.device, dtype=encoder_hidden_states.dtype)
+                injected_conditioning = self.projection_layer(injected_conditioning)
+            result = injected_conditioning * torch.tensor(self.weight, device=injected_conditioning.device, dtype=injected_conditioning.dtype)
         
         return result
     
@@ -234,7 +248,7 @@ class PromptInjectionProcessor:
             else:
                 # Pad or interpolate mask to match sequence length
                 spatial_mask = torch.nn.functional.interpolate(
-                    spatial_mask.unsqueeze(0).unsqueeze(0).float(),
+                    spatial_mask.unsqueeze(0).unsqueeze(0).to(attention_output.dtype),
                     size=(seq_len,), mode='linear', align_corners=False
                 )[0, 0]
         
@@ -251,7 +265,7 @@ class PromptInjectionProcessor:
         # Blend: mask=1 uses injection, mask=0 uses original
         blended_output = (
             spatial_mask * attention_output + 
-            (1.0 - spatial_mask) * original_attention_output
+            (torch.ones_like(spatial_mask) - spatial_mask) * original_attention_output
         )
         
         return blended_output
@@ -266,15 +280,28 @@ class UNetSigmaHook:
     Hook to capture sigma values during sampling for injection timing.
     """
     
-    def __init__(self, patcher: 'UNetPatcher'):
+    def __init__(self, patcher: 'UNetPatcher', scheduler: SchedulerMixin):
         self.patcher = patcher
+        self.scheduler = scheduler
         self.current_sigma = None
     
-    def __call__(self, module, args, output):
-        """Hook called during UNet forward pass."""
-        # Try to extract sigma from the sampling context
-        # This is a simplified approach - in practice we'd need deeper integration
-        return output
+    def __call__(self, module, args, kwargs=None):
+        """Hook called before UNet forward pass."""
+        if not hasattr(self.scheduler, "sigmas"):
+            return
+        
+        timestep = args[1]
+        
+        if not isinstance(timestep, torch.Tensor):
+             return
+            
+        sigma = self.scheduler.sigmas[0] # Fallback
+        if timestep.ndim > 0 and len(timestep) > 0:
+            timestep_index = (self.scheduler.timesteps == timestep[0]).nonzero()
+            if timestep_index.numel() > 0:
+                sigma = self.scheduler.sigmas[timestep_index.item()]
+
+        self.set_sigma(sigma.item())
     
     def set_sigma(self, sigma: float):
         """Set current sigma and update all injection processors."""
@@ -291,14 +318,14 @@ class UNetPatcher(BaseModelPatcher):
     mechanisms with proper sigma-based timing control.
     """
     
-    def __init__(self, model_type: str = "sdxl"):
+    def __init__(self, unet: UNet2DConditionModel, scheduler: SchedulerMixin):
         super().__init__()
-        self.block_mapper = UNetBlockMapper(model_type)
+        self.block_mapper = UNetBlockMapper(unet)
         self.injection_configs: Dict[str, Dict[str, Any]] = {}
         self._original_processors: Dict[str, Any] = {}
         self._injection_processors: Dict[str, PromptInjectionProcessor] = {}
-        self._sigma_hook = UNetSigmaHook(self)
-        self._hooked_unet = None
+        self._sigma_hook = UNetSigmaHook(self, scheduler)
+        self._hook_handle = None
     
     def add_injection(self, block: Union[str, BlockIdentifier], 
                      conditioning: torch.Tensor,
@@ -374,6 +401,10 @@ class UNetPatcher(BaseModelPatcher):
         self._original_processors.clear()
         self._injection_processors.clear()
         
+        # Register the pre-forward hook to capture sigma
+        if self._hook_handle is None:
+            self._hook_handle = unet.register_forward_pre_hook(self._sigma_hook, with_kwargs=False)
+        
         for block_id, config in self.injection_configs.items():
             try:
                 # Find the diffusers path for this block
@@ -424,6 +455,11 @@ class UNetPatcher(BaseModelPatcher):
         """
         if not self.is_patched:
             return unet
+        
+        # Remove the forward hook
+        if self._hook_handle is not None:
+            self._hook_handle.remove()
+            self._hook_handle = None
         
         # Restore original processors
         for module_path, original_processor in self._original_processors.items():

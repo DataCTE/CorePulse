@@ -18,14 +18,14 @@ class SimplePromptInjector(BasePromptInjector):
     into one or more blocks.
     """
     
-    def __init__(self, model_type: str = "sdxl"):
+    def __init__(self, pipeline: DiffusionPipeline):
         """
         Initialize simple prompt injector.
         
         Args:
-            model_type: Model type ("sdxl" or "sd15")
+            pipeline: The diffusers pipeline to inject into.
         """
-        super().__init__(model_type)
+        super().__init__(pipeline)
         self.config: Optional[PromptInjectionConfig] = None
     
     def configure_injections(self, 
@@ -123,8 +123,7 @@ class BlockSpecificInjector(SimplePromptInjector):
     Provides preset methods for injecting into commonly used blocks.
     """
     
-    def inject_content(self, pipeline: DiffusionPipeline, prompt: str, 
-                      weight: float = 1.0) -> DiffusionPipeline:
+    def inject_content(self, prompt: str, weight: float = 1.0):
         """
         Inject prompt into content/subject blocks (middle blocks).
         
@@ -136,13 +135,10 @@ class BlockSpecificInjector(SimplePromptInjector):
         Returns:
             Modified pipeline
         """
-        if self.model_type == "sdxl":
-            return self.inject_prompt(pipeline, "middle:0", prompt, weight)
-        else:  # sd15
-            return self.inject_prompt(pipeline, ["middle:0", "middle:1"], prompt, weight)
+        middle_blocks = [f"middle:{i}" for i in self.patcher.block_mapper.blocks['middle']]
+        self.configure_injections(middle_blocks, prompt, weight)
     
-    def inject_style(self, pipeline: DiffusionPipeline, prompt: str,
-                    weight: float = 1.0) -> DiffusionPipeline:
+    def inject_style(self, prompt: str, weight: float = 1.0):
         """
         Inject prompt into style blocks (output blocks).
         
@@ -154,13 +150,10 @@ class BlockSpecificInjector(SimplePromptInjector):
         Returns:
             Modified pipeline
         """
-        if self.model_type == "sdxl":
-            return self.inject_prompt(pipeline, ["output:0", "output:1"], prompt, weight)
-        else:  # sd15
-            return self.inject_prompt(pipeline, ["output:0", "output:1", "output:2"], prompt, weight)
+        style_blocks = [f"output:{i}" for i in self.patcher.block_mapper.blocks['output']]
+        self.configure_injections(style_blocks, prompt, weight)
     
-    def inject_composition(self, pipeline: DiffusionPipeline, prompt: str,
-                          weight: float = 1.0) -> DiffusionPipeline:
+    def inject_composition(self, prompt: str, weight: float = 1.0):
         """
         Inject prompt into composition blocks (input blocks).
         
@@ -172,44 +165,40 @@ class BlockSpecificInjector(SimplePromptInjector):
         Returns:
             Modified pipeline
         """
-        if self.model_type == "sdxl":
-            return self.inject_prompt(pipeline, ["input:4", "input:5"], prompt, weight)
-        else:  # sd15
-            return self.inject_prompt(pipeline, ["input:7", "input:8", "input:9"], prompt, weight)
+        composition_blocks = [f"input:{i}" for i in self.patcher.block_mapper.blocks['input']]
+        self.configure_injections(composition_blocks, prompt, weight)
 
 
 # Convenience functions for quick usage
-def inject_content_prompt(pipeline: DiffusionPipeline, prompt: str, 
-                         model_type: str = "sdxl", weight: float = 1.0) -> DiffusionPipeline:
+def inject_content_prompt(pipeline: DiffusionPipeline, prompt: str, weight: float = 1.0) -> DiffusionPipeline:
     """
     Quick function to inject a content prompt.
     
     Args:
         pipeline: Pipeline to modify
         prompt: Content prompt
-        model_type: Model type ("sdxl" or "sd15")
         weight: Injection weight
         
     Returns:
         Modified pipeline
     """
-    injector = BlockSpecificInjector(model_type)
-    return injector.inject_content(pipeline, prompt, weight)
+    injector = BlockSpecificInjector(pipeline)
+    injector.inject_content(prompt, weight)
+    return injector.apply_to_pipeline(pipeline)
 
 
-def inject_style_prompt(pipeline: DiffusionPipeline, prompt: str,
-                       model_type: str = "sdxl", weight: float = 1.0) -> DiffusionPipeline:
+def inject_style_prompt(pipeline: DiffusionPipeline, prompt: str, weight: float = 1.0) -> DiffusionPipeline:
     """
     Quick function to inject a style prompt.
     
     Args:
         pipeline: Pipeline to modify
         prompt: Style prompt  
-        model_type: Model type ("sdxl" or "sd15")
         weight: Injection weight
         
     Returns:
         Modified pipeline
     """
-    injector = BlockSpecificInjector(model_type)
-    return injector.inject_style(pipeline, prompt, weight)
+    injector = BlockSpecificInjector(pipeline)
+    injector.inject_style(prompt, weight)
+    return injector.apply_to_pipeline(pipeline)
