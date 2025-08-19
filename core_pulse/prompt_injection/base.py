@@ -10,7 +10,6 @@ from dataclasses import dataclass, field
 
 from ..models.base import BlockIdentifier
 from ..models.unet_patcher import UNetPatcher
-from ..utils.helpers import detect_model_type
 from ..utils.logger import logger
 
 
@@ -45,6 +44,8 @@ class BasePromptInjector(ABC):
     @property
     def model_type(self) -> str:
         """Dynamically detect the model type from the pipeline."""
+        # Local import to avoid circular dependency
+        from ..utils.helpers import detect_model_type
         if self._pipeline:
             return detect_model_type(self._pipeline)
         return "unknown"
@@ -73,18 +74,44 @@ class BasePromptInjector(ABC):
             logger.error(f"Error applying patches to pipeline: {e}", exc_info=True)
             raise
 
-    def encode_prompt(self, prompt: str, pipeline: DiffusionPipeline) -> torch.Tensor:
-        """Encode a prompt using the pipeline's text encoder."""
+    def encode_prompt(self, prompt: str, pipeline: DiffusionPipeline) -> Dict[str, torch.Tensor]:
+        """
+        Encode a prompt using the pipeline's text encoder(s).
+        
+        Returns:
+            A dictionary containing prompt_embeds and other relevant embeddings
+            like pooled_prompt_embeds for SDXL.
+        """
         logger.debug(f"Encoding prompt: '{prompt}'")
         try:
-            encoded = pipeline.encode_prompt(
-                prompt=prompt,
-                device=pipeline.device,
-                num_images_per_prompt=1,
-                do_classifier_free_guidance=False
-            )[0]
-            logger.debug(f"Prompt encoded into tensor of shape: {encoded.shape}")
-            return encoded
+            prompt_args = {
+                "prompt": prompt,
+                "device": pipeline.device,
+                "num_images_per_prompt": 1,
+                "do_classifier_free_guidance": False,
+            }
+
+            if self.model_type == "sdxl":
+                # SDXL encode_prompt returns more than 2 values
+                result = pipeline.encode_prompt(**prompt_args)
+                if isinstance(result, tuple) and len(result) >= 4:
+                    # Typical SDXL return: (prompt_embeds, negative_prompt_embeds, pooled_prompt_embeds, negative_pooled_prompt_embeds)
+                    prompt_embeds, _, pooled_prompt_embeds, _ = result[:4]
+                elif isinstance(result, tuple) and len(result) >= 2:
+                    # Fallback for different SDXL versions
+                    prompt_embeds, pooled_prompt_embeds = result[:2]
+                else:
+                    # Single return value
+                    prompt_embeds = result
+                    pooled_prompt_embeds = None
+                
+                result_dict = {"prompt_embeds": prompt_embeds}
+                if pooled_prompt_embeds is not None:
+                    result_dict["pooled_prompt_embeds"] = pooled_prompt_embeds
+                return result_dict
+            else:
+                prompt_embeds = pipeline.encode_prompt(**prompt_args)
+                return {"prompt_embeds": prompt_embeds}
         except Exception as e:
             logger.error(f"Error encoding prompt '{prompt}': {e}", exc_info=True)
             raise
@@ -107,7 +134,17 @@ class BasePromptInjector(ABC):
             logger.error(msg)
             raise RuntimeError(msg)
         
-        logger.debug(f"Calling patched pipeline with args: {args}, kwargs: {kwargs}")
+        # Handle prompt encoding for attention manipulation
+        prompt = kwargs.pop('prompt', None)
+        if prompt is not None:
+            logger.debug(f"Encoding prompt for pipeline call: '{prompt}'")
+            # We must pass prompt_embeds instead of prompt to ensure the pipeline
+            # uses our exact conditioning, especially for attention manipulation.
+            embedding_dict = self.encode_prompt(prompt, self._pipeline)
+            kwargs.update(embedding_dict)
+            kwargs['prompt'] = None  # Ensure text prompt is not used
+
+        logger.debug(f"Calling patched pipeline with {len(kwargs)} kwargs.")
         try:
             return self._pipeline(*args, **kwargs)
         except Exception as e:

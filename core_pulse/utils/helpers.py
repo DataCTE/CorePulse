@@ -2,7 +2,7 @@
 Helper functions for CorePulse integration.
 """
 
-from typing import Dict, List, Union, Optional, Any
+from typing import Dict, List, Union, Optional, Any, TYPE_CHECKING
 import torch
 from diffusers import (
     DiffusionPipeline, 
@@ -11,6 +11,9 @@ from diffusers import (
     UNet2DConditionModel
 )
 from ..utils.logger import logger
+
+if TYPE_CHECKING:
+    from ..prompt_injection import SimplePromptInjector, AdvancedPromptInjector
 
 
 def detect_model_type(pipeline: DiffusionPipeline) -> str:
@@ -24,32 +27,33 @@ def detect_model_type(pipeline: DiffusionPipeline) -> str:
         Model type string ("sdxl" or "sd15")
     """
     logger.debug("Detecting model type...")
-    model_type = "unknown"
-    if isinstance(pipeline, StableDiffusionXLPipeline):
-        model_type = "sdxl"
-    elif isinstance(pipeline, StableDiffusionPipeline):
-        model_type = "sd15"
     
-    # Fallback: check UNet architecture
-    if hasattr(pipeline, 'unet') and isinstance(pipeline.unet, UNet2DConditionModel):
-        # Check for SDXL characteristics (dual text encoders, larger UNet)
-        if hasattr(pipeline, 'text_encoder_2'):
-            model_type = "sdxl"
+    # Primary check: Class type
+    if isinstance(pipeline, StableDiffusionXLPipeline):
+        logger.info("Detected model type: sdxl (by class)")
+        return "sdxl"
+    if isinstance(pipeline, StableDiffusionPipeline):
+        logger.info("Detected model type: sd15 (by class)")
+        return "sd15"
         
-        # Check UNet block count as a heuristic
-        if hasattr(pipeline.unet, 'down_blocks'):
-            down_block_count = len(pipeline.unet.down_blocks)
-            if down_block_count >= 4:
-                model_type = "sdxl"
-            else:
-                model_type = "sd15"
+    # Secondary check: Attributes (e.g. text_encoder_2 for SDXL)
+    if hasattr(pipeline, 'text_encoder_2'):
+        logger.info("Detected model type: sdxl (by text_encoder_2 attribute)")
+        return "sdxl"
+        
+    # Tertiary check: UNet architecture
+    if hasattr(pipeline, 'unet') and hasattr(pipeline.unet, 'down_blocks'):
+        down_block_count = len(pipeline.unet.down_blocks)
+        if down_block_count >= 4: # SD 1.5 has 4
+            logger.info(f"Detected model type: sd15 (by unet config: {down_block_count} down_blocks)")
+            return "sd15"
+        else: # SDXL has 3
+            logger.info(f"Detected model type: sdxl (by unet config: {down_block_count} down_blocks)")
+            return "sdxl"
     
     # Default fallback
-    else:
-        model_type = "sdxl"
-    
-    logger.info(f"Detected model type: {model_type}")
-    return model_type
+    logger.warning("Could not determine model type, falling back to sdxl.")
+    return "sdxl"
 
 
 def get_available_blocks(pipeline: DiffusionPipeline) -> Dict[str, List[int]]:
@@ -88,6 +92,7 @@ def create_quick_injector(pipeline: DiffusionPipeline,
     """
     logger.debug(f"Creating quick injector with '{interface}' interface.")
     try:
+        # Local import to avoid circular dependency
         from ..prompt_injection import SimplePromptInjector, AdvancedPromptInjector
         
         if interface.lower() == "simple":

@@ -36,7 +36,9 @@ def test_attention_injector_initialization(real_sdxl_pipeline):
 def test_add_attention_manipulation(real_sdxl_pipeline):
     """Test adding a single attention manipulation."""
     injector = AttentionMapInjector(real_sdxl_pipeline)
+    prompt = "a photo of a cat"
     injector.add_attention_manipulation(
+        prompt=prompt,
         block="middle:0",
         target_phrase="cat",
         attention_scale=1.5,
@@ -54,15 +56,20 @@ def test_add_attention_manipulation(real_sdxl_pipeline):
     assert config.attention_scale == 1.5
     assert config.sigma_start == 12.0
     assert config.sigma_end == 0.5
-    # Check that token indices are generated and are integers
+    # Check that token indices are generated and are integers representing positions
     assert isinstance(config.target_token_indices, list)
     assert len(config.target_token_indices) > 0
     assert all(isinstance(i, int) for i in config.target_token_indices)
+    # The token "cat" should be at index 4 in "a photo of a cat" (['<|startoftext|>', 'a', 'photo', 'of', 'a', 'cat', '<|endoftext|>'])
+    # Note: This index can be fragile if the tokenizer changes.
+    assert 5 in config.target_token_indices 
 
 def test_add_attention_manipulation_to_all_blocks(real_sdxl_pipeline):
     """Test adding an attention manipulation to all blocks."""
     injector = AttentionMapInjector(real_sdxl_pipeline)
+    prompt = "a photo of a dog"
     injector.add_attention_manipulation(
+        prompt=prompt,
         block="all",
         target_phrase="dog",
         attention_scale=0.5
@@ -100,9 +107,10 @@ def test_attention_manipulation_influences_output(real_sdxl_pipeline):
     ).images[0]
     base_image = np.array(base_image_pil)
 
-    # Generate manipulated image
+    # --- Test with text prompt ---
     injector = AttentionMapInjector(real_sdxl_pipeline)
     injector.add_attention_manipulation(
+        prompt=prompt,
         block="all", 
         target_phrase="photorealistic", 
         attention_scale=5.0 # A high value to ensure a visible difference
@@ -110,15 +118,42 @@ def test_attention_manipulation_influences_output(real_sdxl_pipeline):
     
     generator.manual_seed(42) # Reset seed for fair comparison
     with injector:
-        injector.apply_to_pipeline(real_sdxl_pipeline)
         manipulated_image_pil = injector(
-            prompt,
+            prompt=prompt,
             generator=generator,
             num_inference_steps=2,
             output_type="pil"
         ).images[0]
-    manipulated_image = np.array(manipulated_image_pil)
+    manipulated_image_text = np.array(manipulated_image_pil)
 
     # Ensure the images are different
-    assert not np.array_equal(base_image, manipulated_image), \
-        "Manipulated image is identical to the base image, meaning attention manipulation had no effect."
+    assert not np.array_equal(base_image, manipulated_image_text), \
+        "Manipulated image (from text) is identical to the base image, meaning attention manipulation had no effect."
+
+    # --- Test with pre-encoded prompt_embeds ---
+    injector.clear_injections()
+    injector.add_attention_manipulation(
+        prompt=prompt,
+        block="all",
+        target_phrase="photorealistic",
+        attention_scale=5.0
+    )
+
+    generator.manual_seed(42) # Reset seed for fair comparison
+    embedding_dict = injector.encode_prompt(prompt, real_sdxl_pipeline)
+    with injector:
+        manipulated_image_pil_embeds = injector(
+            generator=generator,
+            num_inference_steps=2,
+            output_type="pil",
+            **embedding_dict
+        ).images[0]
+    manipulated_image_embeds = np.array(manipulated_image_pil_embeds)
+
+    # Ensure this also produces a different image
+    assert not np.array_equal(base_image, manipulated_image_embeds), \
+        "Manipulated image (from embeds) is identical to the base image."
+    
+    # Ensure both methods produce the same result
+    assert np.array_equal(manipulated_image_text, manipulated_image_embeds), \
+        "Manipulation from text prompt and prompt_embeds produced different results."
