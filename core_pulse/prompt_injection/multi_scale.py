@@ -35,16 +35,62 @@ class MultiScaleInjector(AdvancedPromptInjector):
         super().__init__(pipeline)
         logger.info(f"Initialized MultiScaleInjector for {self.model_type} model")
         
-        # Log available resolution levels
-        for block_id, info in self.patcher.block_mapper.resolution_levels.items():
-            logger.debug(f"Block {block_id}: {info['resolution']} ({info['stage']})")
+        # Pre-compute and cache block mappings for performance
+        self._resolution_blocks_cache = self._build_resolution_cache()
+        self._stage_blocks_cache = self._build_stage_cache()
+        
+        logger.debug(f"Cached mappings: {len(self._resolution_blocks_cache)} resolution levels, "
+                    f"{len(self._stage_blocks_cache)} stages")
+
+    def _build_resolution_cache(self) -> Dict[str, List[BlockIdentifier]]:
+        """Build and cache resolution-to-blocks mapping with pre-created BlockIdentifier objects."""
+        cache = {}
+        for resolution in ["highest", "high", "medium", "low", "lowest"]:
+            block_strings = self.patcher.block_mapper.get_blocks_by_resolution(resolution)
+            if block_strings:
+                # Pre-create BlockIdentifier objects to avoid string parsing overhead
+                cache[resolution] = [BlockIdentifier.from_string(block_str) for block_str in block_strings]
+        return cache
+    
+    def _build_stage_cache(self) -> Dict[str, List[BlockIdentifier]]:
+        """Build and cache stage-to-blocks mapping with pre-created BlockIdentifier objects."""
+        cache = {}
+        for stage in ["downsample", "bottleneck", "upsample"]:
+            block_strings = self.patcher.block_mapper.get_blocks_by_stage(stage)
+            if block_strings:
+                # Pre-create BlockIdentifier objects to avoid string parsing overhead
+                cache[stage] = [BlockIdentifier.from_string(block_str) for block_str in block_strings]
+        return cache
+    
+    def _add_prompt_to_blocks(self, 
+                             prompt: str,
+                             blocks: List[BlockIdentifier],
+                             weight: float = 1.0,
+                             sigma_start: float = 0.0,
+                             sigma_end: float = 1.0,
+                             spatial_mask: Optional[torch.Tensor] = None):
+        """Efficiently add the same prompt to multiple blocks using pre-created BlockIdentifier objects."""
+        if not blocks:
+            return
+            
+        logger.debug(f"Adding prompt to {len(blocks)} blocks: {[str(block) for block in blocks]}")
+        for block in blocks:
+            # Pass BlockIdentifier directly - no string parsing needed!
+            self.add_injection(
+                block=block,
+                prompt=prompt,
+                weight=weight,
+                sigma_start=sigma_start,
+                sigma_end=sigma_end,
+                spatial_mask=spatial_mask
+            )
 
     def add_detail_injection(self,
                            prompt: str,
-                           weight: float = 1.0,
+                           weight: float = 2.2,  # Balanced default weight - noticeable but not overwhelming
                            resolution_levels: List[str] = ["highest", "high"],
-                           sigma_start: float = 0.0,
-                           sigma_end: float = 1.0,
+                           sigma_start: float = 3.0,  # Wider range - ensures injection on multiple steps
+                           sigma_end: float = 0.0,    # Through final details
                            spatial_mask: Optional[torch.Tensor] = None):
         """
         Inject prompts that control fine details and textures.
@@ -64,35 +110,28 @@ class MultiScaleInjector(AdvancedPromptInjector):
                 resolution_levels=["highest"]
             )
         """
-        logger.info(f"Adding detail injection: '{prompt}' at {resolution_levels} resolution")
+        logger.debug(f"Adding detail injection: '{prompt}' at {resolution_levels} resolution")
         
+        # Use cached mappings for better performance
         target_blocks = []
         for resolution in resolution_levels:
-            blocks = self.patcher.block_mapper.get_blocks_by_resolution(resolution)
+            blocks = self._resolution_blocks_cache.get(resolution, [])
             target_blocks.extend(blocks)
         
         if not target_blocks:
             logger.warning(f"No blocks found for resolution levels: {resolution_levels}")
             return
         
-        for block in target_blocks:
-            self.add_injection(
-                block=block,
-                prompt=prompt,
-                weight=weight,
-                sigma_start=sigma_start,
-                sigma_end=sigma_end,
-                spatial_mask=spatial_mask
-            )
-        
-        logger.debug(f"Applied detail injection to {len(target_blocks)} blocks: {target_blocks}")
+        # Batch operation
+        self._add_prompt_to_blocks(prompt, target_blocks, weight, sigma_start, sigma_end, spatial_mask)
+        logger.debug(f"Applied detail injection to {len(target_blocks)} blocks")
 
     def add_structure_injection(self,
                               prompt: str,
-                              weight: float = 1.0,
-                              resolution_levels: List[str] = ["low", "lowest"],
-                              sigma_start: float = 0.0,
-                              sigma_end: float = 1.0,
+                              weight: float = 2.5,  # Balanced structural weight - good influence without overpowering
+                              resolution_levels: List[str] = ["lowest"],  # Focus on bottleneck for composition
+                              sigma_start: float = 15.0, # Wide range - ensures structural influence
+                              sigma_end: float = 0.5,    # Through mid-generation
                               spatial_mask: Optional[torch.Tensor] = None):
         """
         Inject prompts that control overall structure and composition.
@@ -112,28 +151,21 @@ class MultiScaleInjector(AdvancedPromptInjector):
                 resolution_levels=["lowest"]
             )
         """
-        logger.info(f"Adding structure injection: '{prompt}' at {resolution_levels} resolution")
+        logger.debug(f"Adding structure injection: '{prompt}' at {resolution_levels} resolution")
         
+        # Use cached mappings for better performance
         target_blocks = []
         for resolution in resolution_levels:
-            blocks = self.patcher.block_mapper.get_blocks_by_resolution(resolution)
+            blocks = self._resolution_blocks_cache.get(resolution, [])
             target_blocks.extend(blocks)
         
         if not target_blocks:
             logger.warning(f"No blocks found for resolution levels: {resolution_levels}")
             return
         
-        for block in target_blocks:
-            self.add_injection(
-                block=block,
-                prompt=prompt,
-                weight=weight,
-                sigma_start=sigma_start,
-                sigma_end=sigma_end,
-                spatial_mask=spatial_mask
-            )
-        
-        logger.debug(f"Applied structure injection to {len(target_blocks)} blocks: {target_blocks}")
+        # Batch operation
+        self._add_prompt_to_blocks(prompt, target_blocks, weight, sigma_start, sigma_end, spatial_mask)
+        logger.debug(f"Applied structure injection to {len(target_blocks)} blocks")
 
     def add_midlevel_injection(self,
                              prompt: str,
@@ -160,28 +192,21 @@ class MultiScaleInjector(AdvancedPromptInjector):
                 resolution_levels=["medium"]
             )
         """
-        logger.info(f"Adding mid-level injection: '{prompt}' at {resolution_levels} resolution")
+        logger.debug(f"Adding mid-level injection: '{prompt}' at {resolution_levels} resolution")
         
+        # Use cached mappings for better performance
         target_blocks = []
         for resolution in resolution_levels:
-            blocks = self.patcher.block_mapper.get_blocks_by_resolution(resolution)
+            blocks = self._resolution_blocks_cache.get(resolution, [])
             target_blocks.extend(blocks)
         
         if not target_blocks:
             logger.warning(f"No blocks found for resolution levels: {resolution_levels}")
             return
         
-        for block in target_blocks:
-            self.add_injection(
-                block=block,
-                prompt=prompt,
-                weight=weight,
-                sigma_start=sigma_start,
-                sigma_end=sigma_end,
-                spatial_mask=spatial_mask
-            )
-        
-        logger.debug(f"Applied mid-level injection to {len(target_blocks)} blocks: {target_blocks}")
+        # Batch operation
+        self._add_prompt_to_blocks(prompt, target_blocks, weight, sigma_start, sigma_end, spatial_mask)
+        logger.debug(f"Applied mid-level injection to {len(target_blocks)} blocks")
 
     def add_hierarchical_prompts(self,
                                structure_prompt: str,
@@ -209,36 +234,53 @@ class MultiScaleInjector(AdvancedPromptInjector):
                 weights={"structure": 1.5, "midlevel": 1.2, "detail": 1.0}
             )
         """
-        logger.info("Adding hierarchical multi-scale prompt system")
+        logger.debug("Adding hierarchical multi-scale prompt system")
         
-        weights = weights or {}
+        # Balanced default weights for noticeable but controlled multi-scale effects
+        default_weights = {"structure": 3.0, "midlevel": 2.5, "detail": 2.2}
+        weights = {**default_weights, **(weights or {})}
         
-        # Structure (low resolution)
-        self.add_structure_injection(
-            structure_prompt,
-            weight=weights.get("structure", 1.0),
-            sigma_start=sigma_start,
-            sigma_end=sigma_end
-        )
+        # OPTIMIZED: Direct batch operations instead of nested method calls
         
-        # Mid-level (medium resolution)
-        if midlevel_prompt:
-            self.add_midlevel_injection(
-                midlevel_prompt,
-                weight=weights.get("midlevel", 1.0),
-                sigma_start=sigma_start,
-                sigma_end=sigma_end
+        # Structure (low resolution blocks)
+        structure_blocks = []
+        for resolution in ["low", "lowest"]:
+            structure_blocks.extend(self._resolution_blocks_cache.get(resolution, []))
+        
+        if structure_blocks:
+            self._add_prompt_to_blocks(
+                structure_prompt, structure_blocks,
+                weight=weights.get("structure", 1.0),
+                sigma_start=sigma_start, sigma_end=sigma_end
             )
         
-        # Details (high resolution)
-        self.add_detail_injection(
-            detail_prompt,
-            weight=weights.get("detail", 1.0),
-            sigma_start=sigma_start,
-            sigma_end=sigma_end
-        )
+        # Mid-level (medium resolution blocks)
+        if midlevel_prompt:
+            midlevel_blocks = []
+            for resolution in ["medium", "high"]:
+                midlevel_blocks.extend(self._resolution_blocks_cache.get(resolution, []))
+                
+            if midlevel_blocks:
+                self._add_prompt_to_blocks(
+                    midlevel_prompt, midlevel_blocks,
+                    weight=weights.get("midlevel", 1.0),
+                    sigma_start=sigma_start, sigma_end=sigma_end
+                )
         
-        logger.info("Hierarchical prompt system configured")
+        # Details (high resolution blocks)
+        detail_blocks = []
+        for resolution in ["highest", "high"]:
+            detail_blocks.extend(self._resolution_blocks_cache.get(resolution, []))
+            
+        if detail_blocks:
+            self._add_prompt_to_blocks(
+                detail_prompt, detail_blocks,
+                weight=weights.get("detail", 1.0),
+                sigma_start=sigma_start, sigma_end=sigma_end
+            )
+        
+        total_blocks = len(structure_blocks) + len(detail_blocks) + (len(midlevel_blocks) if midlevel_prompt else 0)
+        logger.debug(f"Hierarchical prompt system configured: {total_blocks} total blocks")
 
     def add_stage_based_injection(self,
                                 downsample_prompt: Optional[str] = None,
@@ -266,126 +308,112 @@ class MultiScaleInjector(AdvancedPromptInjector):
                 weights={"downsample": 1.2, "bottleneck": 1.5, "upsample": 1.0}
             )
         """
-        logger.info("Adding stage-based injection system")
+        logger.debug("Adding stage-based injection system")
         
         weights = weights or {}
+        total_blocks = 0
         
+        # Use cached mappings for better performance
         if downsample_prompt:
-            blocks = self.patcher.block_mapper.get_blocks_by_stage("downsample")
-            for block in blocks:
-                self.add_injection(
-                    block=block,
-                    prompt=downsample_prompt,
+            blocks = self._stage_blocks_cache.get("downsample", [])
+            if blocks:
+                self._add_prompt_to_blocks(
+                    downsample_prompt, blocks,
                     weight=weights.get("downsample", 1.0),
-                    sigma_start=sigma_start,
-                    sigma_end=sigma_end
+                    sigma_start=sigma_start, sigma_end=sigma_end
                 )
+                total_blocks += len(blocks)
         
         if bottleneck_prompt:
-            blocks = self.patcher.block_mapper.get_blocks_by_stage("bottleneck")
-            for block in blocks:
-                self.add_injection(
-                    block=block,
-                    prompt=bottleneck_prompt,
+            blocks = self._stage_blocks_cache.get("bottleneck", [])
+            if blocks:
+                self._add_prompt_to_blocks(
+                    bottleneck_prompt, blocks,
                     weight=weights.get("bottleneck", 1.0),
-                    sigma_start=sigma_start,
-                    sigma_end=sigma_end
+                    sigma_start=sigma_start, sigma_end=sigma_end
                 )
+                total_blocks += len(blocks)
         
         if upsample_prompt:
-            blocks = self.patcher.block_mapper.get_blocks_by_stage("upsample")
-            for block in blocks:
-                self.add_injection(
-                    block=block,
-                    prompt=upsample_prompt,
+            blocks = self._stage_blocks_cache.get("upsample", [])
+            if blocks:
+                self._add_prompt_to_blocks(
+                    upsample_prompt, blocks,
                     weight=weights.get("upsample", 1.0),
-                    sigma_start=sigma_start,
-                    sigma_end=sigma_end
+                    sigma_start=sigma_start, sigma_end=sigma_end
                 )
+                total_blocks += len(blocks)
         
-        logger.info("Stage-based injection system configured")
+        logger.debug(f"Stage-based injection system configured: {total_blocks} total blocks")
+
+    def add_extreme_multi_scale(self,
+                               base_prompt: str,
+                               structure_keywords: str = "massive, towering, imposing",
+                               detail_keywords: str = "intricate, ornate, weathered",
+                               weight_multiplier: float = 2.0):
+        """
+        Add EXTREME multi-scale injection for dramatic effects.
+        
+        This method creates very strong multi-scale prompts with high weights
+        designed to dramatically override the base prompt.
+        
+        Args:
+            base_prompt: Base subject (e.g., "cathedral", "castle", "mountain")
+            structure_keywords: Structural descriptors for composition
+            detail_keywords: Detail descriptors for textures/features
+            weight_multiplier: Multiplier for already-strong default weights
+            
+        Example:
+            injector.add_extreme_multi_scale(
+                base_prompt="cathedral",
+                structure_keywords="colossal gothic fortress",
+                detail_keywords="carved gargoyles, ancient stonework"
+            )
+        """
+        logger.info("Adding EXTREME multi-scale injection for dramatic effects")
+        
+        # Create extreme prompts
+        structure_prompt = f"{structure_keywords} {base_prompt}, dramatic imposing architecture"
+        detail_prompt = f"{detail_keywords} {base_prompt} details, elaborate craftsmanship"
+        
+        # Apply with strong but controlled weights
+        extreme_weights = {
+            "structure": 3.5 * weight_multiplier,
+            "detail": 2.8 * weight_multiplier
+        }
+        
+        self.add_hierarchical_prompts(
+            structure_prompt=structure_prompt,
+            detail_prompt=detail_prompt,
+            weights=extreme_weights,
+            sigma_start=1.0,  # Full diffusion range for maximum influence
+            sigma_end=0.1
+        )
+        
+        logger.info(f"EXTREME multi-scale configured: structure weight {extreme_weights['structure']}, detail weight {extreme_weights['detail']}")
 
     def get_resolution_summary(self) -> Dict[str, List[str]]:
         """
         Get a summary of which blocks correspond to which resolution levels.
         
         Returns:
-            Dictionary mapping resolution levels to block identifiers
+            Dictionary mapping resolution levels to block identifier strings (for compatibility)
         """
-        summary = {}
-        for resolution in ["highest", "high", "medium", "low", "lowest"]:
-            blocks = self.patcher.block_mapper.get_blocks_by_resolution(resolution)
-            if blocks:
-                summary[resolution] = blocks
-        return summary
+        # Convert BlockIdentifier objects back to strings for API compatibility
+        return {
+            resolution: [str(block) for block in blocks] 
+            for resolution, blocks in self._resolution_blocks_cache.items()
+        }
 
     def get_stage_summary(self) -> Dict[str, List[str]]:
         """
         Get a summary of which blocks correspond to which processing stages.
         
         Returns:
-            Dictionary mapping stages to block identifiers
+            Dictionary mapping stages to block identifier strings (for compatibility)
         """
-        summary = {}
-        for stage in ["downsample", "bottleneck", "upsample"]:
-            blocks = self.patcher.block_mapper.get_blocks_by_stage(stage)
-            if blocks:
-                summary[stage] = blocks
-        return summary
-
-
-# Convenience functions for common multi-scale patterns
-def create_hierarchical_architecture(pipeline: DiffusionPipeline,
-                                   building_type: str = "castle",
-                                   detail_level: str = "high") -> MultiScaleInjector:
-    """
-    Create a hierarchical architecture with structure, features, and details.
-    
-    Args:
-        pipeline: Diffusion pipeline
-        building_type: Type of architecture (castle, cathedral, etc.)
-        detail_level: Level of detail (low, medium, high)
-    """
-    injector = MultiScaleInjector(pipeline)
-    
-    structure_prompts = {
-        "castle": "majestic medieval castle silhouette, imposing fortress",
-        "cathedral": "gothic cathedral silhouette, soaring spires",
-        "palace": "grand palace silhouette, symmetrical architecture"
-    }
-    
-    detail_prompts = {
-        "low": f"simple {building_type} features",
-        "medium": f"ornate {building_type} details, decorative elements", 
-        "high": f"intricate {building_type} stonework, elaborate carvings, weathered textures"
-    }
-    
-    injector.add_hierarchical_prompts(
-        structure_prompt=structure_prompts.get(building_type, f"{building_type} silhouette"),
-        midlevel_prompt=f"ornate {building_type} architectural features",
-        detail_prompt=detail_prompts[detail_level]
-    )
-    
-    return injector
-
-
-def enhance_texture_detail(pipeline: DiffusionPipeline,
-                         texture_prompt: str = "intricate textures, fine details",
-                         detail_weight: float = 1.3) -> MultiScaleInjector:
-    """
-    Enhance texture detail at high resolution levels.
-    """
-    injector = MultiScaleInjector(pipeline)
-    injector.add_detail_injection(texture_prompt, weight=detail_weight)
-    return injector
-
-
-def improve_composition_structure(pipeline: DiffusionPipeline,
-                                composition_prompt: str = "balanced composition, harmonious structure",
-                                structure_weight: float = 1.4) -> MultiScaleInjector:
-    """
-    Improve overall composition and structure at low resolution levels.
-    """
-    injector = MultiScaleInjector(pipeline)
-    injector.add_structure_injection(composition_prompt, weight=structure_weight)
-    return injector
+        # Convert BlockIdentifier objects back to strings for API compatibility
+        return {
+            stage: [str(block) for block in blocks] 
+            for stage, blocks in self._stage_blocks_cache.items()
+        }

@@ -449,6 +449,13 @@ dev = [
     { name = "pytest" },
 ]
 
+[package.dev-dependencies]
+dev = [
+    { name = "black" },
+    { name = "flake8" },
+    { name = "pytest" },
+]
+
 [package.metadata]
 requires-dist = [
     { name = "accelerate" },
@@ -464,6 +471,13 @@ requires-dist = [
     { name = "transformers", git = "https://github.com/huggingface/transformers.git" },
 ]
 provides-extras = ["dev"]
+
+[package.metadata.requires-dev]
+dev = [
+    { name = "black" },
+    { name = "flake8" },
+    { name = "pytest" },
+]
 
 [[package]]
 name = "cycler"

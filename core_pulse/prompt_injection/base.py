@@ -3,7 +3,7 @@ Base classes for prompt injection in CorePulse.
 """
 
 from abc import ABC
-from typing import Dict, Optional, Any
+from typing import Dict, Optional, Any, Union
 import torch
 from diffusers import DiffusionPipeline
 from dataclasses import dataclass, field
@@ -74,58 +74,120 @@ class BasePromptInjector(ABC):
             logger.error(f"Error applying patches to pipeline: {e}", exc_info=True)
             raise
 
-    def encode_prompt(self, prompt: str, pipeline: DiffusionPipeline) -> Dict[str, torch.Tensor]:
+    def encode_prompt(self, prompt: str, pipeline: DiffusionPipeline) -> Union[torch.Tensor, Dict[str, torch.Tensor]]:
         """
-        Encode a prompt using the pipeline's text encoder(s).
+        Encode a prompt using the pipeline's text encoder(s) with GPU optimization.
         
         Returns:
-            A dictionary containing prompt_embeds and other relevant embeddings
-            like pooled_prompt_embeds for SDXL.
+            For SDXL: Dict with 'prompt_embeds' and 'pooled_prompt_embeds'
+            For SD1.5: Tensor with prompt embeddings
         """
-        logger.debug(f"Encoding prompt: '{prompt}'")
+        logger.debug(f"Starting encode_prompt for: '{prompt[:50]}...'")
         try:
-            prompt_args = {
-                "prompt": prompt,
-                "device": pipeline.device,
-                "num_images_per_prompt": 1,
-                "do_classifier_free_guidance": False,
-            }
-
+            # Ensure pipeline components are on GPU if available
+            device = pipeline.device if hasattr(pipeline, 'device') else 'cuda' if torch.cuda.is_available() else 'cpu'
+            logger.debug(f"Using device: {device}, Model type: {self.model_type}")
+            
             if self.model_type == "sdxl":
-                # SDXL encode_prompt returns more than 2 values
-                result = pipeline.encode_prompt(**prompt_args)
-                if isinstance(result, tuple) and len(result) >= 4:
-                    # Typical SDXL return: (prompt_embeds, negative_prompt_embeds, pooled_prompt_embeds, negative_pooled_prompt_embeds)
-                    prompt_embeds, _, pooled_prompt_embeds, _ = result[:4]
-                elif isinstance(result, tuple) and len(result) >= 2:
-                    # Fallback for different SDXL versions
-                    prompt_embeds, pooled_prompt_embeds = result[:2]
-                else:
-                    # Single return value
-                    prompt_embeds = result
-                    pooled_prompt_embeds = None
-                
-                result_dict = {"prompt_embeds": prompt_embeds}
-                if pooled_prompt_embeds is not None:
-                    result_dict["pooled_prompt_embeds"] = pooled_prompt_embeds
-                return result_dict
+                # FULLY GPU-OPTIMIZED SDXL encoding
+                with torch.no_grad():
+                    # Ensure text encoders are on GPU first
+                    if not next(pipeline.text_encoder.parameters()).is_cuda and str(device).startswith('cuda'):
+                        logger.debug("Moving text encoders to GPU")
+                        pipeline.text_encoder = pipeline.text_encoder.to(device)
+                        pipeline.text_encoder_2 = pipeline.text_encoder_2.to(device)
+                    
+                    # Tokenize directly with GPU tensors
+                    tokens_one = pipeline.tokenizer(
+                        prompt,
+                        padding="max_length",
+                        max_length=pipeline.tokenizer.model_max_length,
+                        truncation=True,
+                        return_tensors="pt"
+                    )
+                    tokens_two = pipeline.tokenizer_2(
+                        prompt,
+                        padding="max_length", 
+                        max_length=pipeline.tokenizer_2.model_max_length,
+                        truncation=True,
+                        return_tensors="pt"
+                    )
+                    
+                    # Move tokens to GPU immediately (all operations stay on GPU)
+                    input_ids_one = tokens_one.input_ids.to(device, non_blocking=True)
+                    input_ids_two = tokens_two.input_ids.to(device, non_blocking=True)
+                    
+                    # Run both encoders on GPU
+                    prompt_embeds_one_out = pipeline.text_encoder(input_ids_one, output_hidden_states=True)
+                    prompt_embeds_two_out = pipeline.text_encoder_2(input_ids_two, output_hidden_states=True)
+                    
+                    # Extract embeddings and concatenate (all on GPU)
+                    prompt_embeds_one = prompt_embeds_one_out.hidden_states[-2]
+                    prompt_embeds_two = prompt_embeds_two_out.hidden_states[-2]
+                    prompt_embeds = torch.cat([prompt_embeds_one, prompt_embeds_two], dim=-1)
+                    
+                    # Extract pooled embeddings from second encoder (required for SDXL)
+                    pooled_prompt_embeds = prompt_embeds_two_out[0]
+                    
+                    logger.debug(f"SDXL encoding successful on {device}: prompt_embeds shape {prompt_embeds.shape}, pooled shape {pooled_prompt_embeds.shape}")
+                    return {
+                        'prompt_embeds': prompt_embeds,
+                        'pooled_prompt_embeds': pooled_prompt_embeds
+                    }
             else:
-                prompt_embeds = pipeline.encode_prompt(**prompt_args)
-                return {"prompt_embeds": prompt_embeds}
+                # FULLY GPU-OPTIMIZED SD1.5 encoding
+                with torch.no_grad():
+                    # Ensure text encoder is on GPU first
+                    if not next(pipeline.text_encoder.parameters()).is_cuda and str(device).startswith('cuda'):
+                        logger.debug("Moving text encoder to GPU")
+                        pipeline.text_encoder = pipeline.text_encoder.to(device)
+                    
+                    # Tokenize directly with GPU tensors
+                    tokens = pipeline.tokenizer(
+                        prompt,
+                        padding="max_length",
+                        max_length=pipeline.tokenizer.model_max_length,
+                        truncation=True,
+                        return_tensors="pt"
+                    )
+                    
+                    # Move tokens to GPU immediately (all operations stay on GPU)
+                    input_ids = tokens.input_ids.to(device, non_blocking=True)
+                    
+                    # Run encoder on GPU
+                    prompt_embeds = pipeline.text_encoder(input_ids)[0]
+                    
+                    logger.debug(f"SD1.5 encoding successful on {device}: shape {prompt_embeds.shape}")
+                    return prompt_embeds
+                    
         except Exception as e:
             logger.error(f"Error encoding prompt '{prompt}': {e}", exc_info=True)
             raise
 
     def __enter__(self):
         """Apply patches when entering context."""
-        if self._pipeline:
-            self.apply_to_pipeline(self._pipeline)
-        return self
+        logger.debug("Entering context manager")
+        try:
+            if self._pipeline:
+                logger.debug("Pipeline exists, applying to pipeline")
+                self.apply_to_pipeline(self._pipeline)
+            else:
+                logger.warning("No pipeline set in context manager")
+            logger.debug("Context manager entry completed")
+            return self
+        except Exception as e:
+            logger.error(f"Error in context manager __enter__: {e}", exc_info=True)
+            raise
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         """Remove patches when exiting context."""
-        logger.debug("Exiting context, clearing injections.")
-        self.clear_injections()
+        logger.debug("Exiting context, clearing injections")
+        try:
+            self.clear_injections()
+            logger.debug("Context manager exit completed")
+        except Exception as e:
+            logger.error(f"Error in context manager __exit__: {e}", exc_info=True)
+            # Don't re-raise in __exit__ as it could mask the original exception
 
     def __call__(self, *args, **kwargs):
         """Make the injector callable to pass through to the pipeline."""
@@ -140,11 +202,20 @@ class BasePromptInjector(ABC):
             logger.debug(f"Encoding prompt for pipeline call: '{prompt}'")
             # We must pass prompt_embeds instead of prompt to ensure the pipeline
             # uses our exact conditioning, especially for attention manipulation.
-            embedding_dict = self.encode_prompt(prompt, self._pipeline)
-            kwargs.update(embedding_dict)
+            encoding_result = self.encode_prompt(prompt, self._pipeline)
+            
+            if isinstance(encoding_result, dict):
+                # SDXL: Pass both prompt_embeds and pooled_prompt_embeds
+                kwargs.update(encoding_result)
+                logger.debug(f"SDXL: Passing both embeddings - prompt_embeds: {encoding_result['prompt_embeds'].shape}, pooled: {encoding_result['pooled_prompt_embeds'].shape}")
+            else:
+                # SD1.5: Just prompt_embeds
+                kwargs['prompt_embeds'] = encoding_result
+                logger.debug(f"SD1.5: Passing prompt_embeds: {encoding_result.shape}")
+                
             kwargs['prompt'] = None  # Ensure text prompt is not used
 
-        logger.debug(f"Calling patched pipeline with {len(kwargs)} kwargs.")
+        logger.debug(f"Calling patched pipeline with {len(kwargs)} kwargs: {list(kwargs.keys())}")
         try:
             return self._pipeline(*args, **kwargs)
         except Exception as e:

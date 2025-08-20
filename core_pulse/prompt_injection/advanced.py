@@ -22,6 +22,8 @@ class AdvancedPromptInjector(BasePromptInjector):
     def __init__(self, pipeline: DiffusionPipeline):
         super().__init__(pipeline)
         self.configs: Dict[BlockIdentifier, PromptInjectionConfig] = {}
+        # Add prompt encoding cache for performance
+        self._prompt_cache: Dict[str, torch.Tensor] = {}
     
     def configure_injections(self, 
                            injection_map: Union[Dict[str, Any], List[Dict[str, Any]]]):
@@ -166,33 +168,67 @@ class AdvancedPromptInjector(BasePromptInjector):
         
         total_configs = len(self.configs) + len(self.patcher.attention_map_configs) + len(self.patcher.self_attention_configs)
         logger.info(f"Applying {total_configs} configurations: {len(self.configs)} prompt injections, {len(self.patcher.attention_map_configs)} attention manipulations, {len(self.patcher.self_attention_configs)} self-attention manipulations.")
-        # Encode all prompts and add to patcher
-        for block_id, config in self.configs.items():
+        
+        # OPTIMIZATION: Batch encode unique prompts to avoid redundant encoding
+        logger.debug("Starting optimized batch prompt encoding")
+        
+        # Step 1: Collect unique prompts that need encoding
+        unique_prompts = set()
+        for config in self.configs.values():
+            if config._encoded_prompt is None:
+                unique_prompts.add(config.prompt)
+        
+        logger.debug(f"Found {len(unique_prompts)} unique prompts to encode (vs {len(self.configs)} total configs)")
+        
+        # Step 2: Batch encode unique prompts and cache them
+        for prompt in unique_prompts:
+            if prompt not in self._prompt_cache:
+                logger.debug(f"Encoding unique prompt: '{prompt[:30]}...'")
+                self._prompt_cache[prompt] = self.encode_prompt(prompt, pipeline)
+        
+        # Step 3: Apply cached encodings to all configs
+        logger.debug("Applying cached encodings to configurations")
+        for i, (block_id, config) in enumerate(self.configs.items()):
+            logger.debug(f"Processing config {i+1}/{len(self.configs)} for block {block_id}")
             try:
-                # Use pre-encoded prompt if available, otherwise encode the prompt
+                # Use pre-encoded prompt if available, otherwise use cached encoding
                 if config._encoded_prompt is not None:
                     logger.debug(f"Using pre-encoded prompt for block {block_id}")
-                    encoded_prompt = config._encoded_prompt
+                    conditioning = config._encoded_prompt
                 else:
-                    encoded_prompt = self.encode_prompt(config.prompt, pipeline)
+                    logger.debug(f"Using cached encoding for block {block_id}")
+                    cached_encoding = self._prompt_cache[config.prompt]
+                    
+                    # Extract conditioning tensor (works for both SDXL dict and SD1.5 tensor)
+                    if isinstance(cached_encoding, dict):
+                        conditioning = cached_encoding['prompt_embeds']
+                    else:
+                        conditioning = cached_encoding
                 
+                logger.debug(f"Adding injection to patcher for block {block_id}")
                 self.patcher.add_injection(
                     block=block_id,
-                    conditioning=encoded_prompt,
+                    conditioning=conditioning,
                     weight=config.weight,
                     sigma_start=config.sigma_start,
                     sigma_end=config.sigma_end,
                     spatial_mask=config.spatial_mask
                 )
+                logger.debug(f"Successfully added injection for block {block_id}")
+                
             except Exception as e:
                 logger.error(f"Failed to process and add injection for block {block_id}: {e}", exc_info=True)
                 raise
+        
+        logger.debug("Optimized prompt encoding completed")
         
         return super().apply_to_pipeline(pipeline)
     
     def clear_injections(self):
         """Clear all configured injections."""
         self.configs.clear()
+        # Clear prompt cache to avoid memory leaks
+        self._prompt_cache.clear()
         super().clear_injections()
 
 

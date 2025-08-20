@@ -191,10 +191,10 @@ class UnifiedAdvancedInjector(AdvancedPromptInjector):
 
     def add_detail_injection(self,
                            prompt: str,
-                           weight: float = 1.0,
+                           weight: float = 2.2,  # Balanced default weight
                            resolution_levels: List[str] = ["highest", "high"],
-                           sigma_start: float = 0.0,
-                           sigma_end: float = 1.0,
+                           sigma_start: float = 0.7,  # Target detail refinement phase
+                           sigma_end: float = 0.0,    # Through final details
                            spatial_mask: Optional[torch.Tensor] = None):
         """
         Inject prompts that control fine details and textures.
@@ -224,10 +224,10 @@ class UnifiedAdvancedInjector(AdvancedPromptInjector):
 
     def add_structure_injection(self,
                               prompt: str,
-                              weight: float = 1.0,
-                              resolution_levels: List[str] = ["low", "lowest"],
-                              sigma_start: float = 0.0,
-                              sigma_end: float = 1.0,
+                              weight: float = 2.5,  # Balanced structural weight
+                              resolution_levels: List[str] = ["lowest"],  # Focus on bottleneck
+                              sigma_start: float = 1.0,  # Target composition phase
+                              sigma_end: float = 0.3,    # Through mid-generation
                               spatial_mask: Optional[torch.Tensor] = None):
         """
         Inject prompts that control overall structure and composition.
@@ -267,12 +267,14 @@ class UnifiedAdvancedInjector(AdvancedPromptInjector):
         """
         logger.info("Adding hierarchical multi-scale prompt system")
         
-        weights = weights or {}
+        # Balanced default weights for noticeable but controlled multi-scale effects
+        default_weights = {"structure": 3.0, "midlevel": 2.5, "detail": 2.2}
+        weights = {**default_weights, **(weights or {})}
         
         # Structure (low resolution)
         self.add_structure_injection(
             structure_prompt,
-            weight=weights.get("structure", 1.0),
+            weight=weights.get("structure", 3.0),
             sigma_start=sigma_start,
             sigma_end=sigma_end
         )
@@ -288,7 +290,7 @@ class UnifiedAdvancedInjector(AdvancedPromptInjector):
                 self.add_injection(
                     block=block,
                     prompt=midlevel_prompt,
-                    weight=weights.get("midlevel", 1.0),
+                    weight=weights.get("midlevel", 2.5),
                     sigma_start=sigma_start,
                     sigma_end=sigma_end
                 )
@@ -296,7 +298,7 @@ class UnifiedAdvancedInjector(AdvancedPromptInjector):
         # Details (high resolution)
         self.add_detail_injection(
             detail_prompt,
-            weight=weights.get("detail", 1.0),
+            weight=weights.get("detail", 2.2),
             sigma_start=sigma_start,
             sigma_end=sigma_end
         )

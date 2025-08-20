@@ -28,6 +28,29 @@ Control how much the model focuses on specific words in your prompt by directly 
 - **Flexible Interfaces**: Simple one-liners to advanced multi-block configurations  
 - **Seamless Integration**: Drop-in compatibility with HuggingFace Diffusers
 - **Context Management**: Automatic patch cleanup with Python context managers
+- **Precise Timing Control**: Sigma-based injection windows for optimal effect
+
+## Important Concepts
+
+### **Sigma Ranges: Timing is Everything**
+Prompt injections are applied during specific phases of the diffusion process using **sigma values** (noise levels):
+
+- **High Sigma** (~15-3): Early denoising steps, global structure formation
+- **Medium Sigma** (~3-0.5): Mid-process, composition and major features  
+- **Low Sigma** (~0.5-0): Final steps, detail refinement
+
+**⚠️ Critical:** Default sigma ranges may be too narrow! If your injections seem to have no effect, try wider ranges:
+
+```python
+# ❌ Too narrow - might only inject on 1-2 steps
+injector.add_injection("middle:0", "dragon", sigma_start=1.0, sigma_end=0.3)
+
+# ✅ Better - injects across most steps  
+injector.add_injection("middle:0", "dragon", sigma_start=15.0, sigma_end=0.0)
+
+# ✅ Always inject - bypass timing completely
+injector.add_injection("middle:0", "dragon", sigma_start=1000.0, sigma_end=-1000.0)
+```
 
 ## Quick Examples
 
@@ -43,7 +66,9 @@ with SimplePromptInjector(pipeline) as injector:
     injector.configure_injections(
         block="middle:0",  # Content block
         prompt="white cat",
-        weight=1.0
+        weight=2.0,        # Strong enough to be visible
+        sigma_start=15.0,  # Start early in process
+        sigma_end=0.0      # Continue through final steps
     )
     
     # Base prompt provides context, injection overrides content
@@ -61,7 +86,9 @@ with AttentionMapInjector(pipeline) as injector:
         prompt="a photorealistic portrait of an astronaut",
         block="all",  
         target_phrase="photorealistic",
-        attention_scale=5.0  # 5x more attention on "photorealistic"
+        attention_scale=5.0,  # 5x more attention on "photorealistic"
+        sigma_start=15.0,     # Apply throughout generation
+        sigma_end=0.0
     )
     
     # Same prompt, but model focuses much more on making it photorealistic
@@ -115,6 +142,42 @@ CorePulse offers multiple levels of control:
 **Regional Control** (`sdxl_examples.py`):
 - Left half: crystal castle, Right half: fire dragon  
 - Spatial masks with soft blending
+
+## Troubleshooting
+
+### **"My injections don't seem to work / images look identical"**
+
+This is usually a **sigma range issue**. The injection system works perfectly, but narrow sigma ranges mean injections only apply to 1-2 denoising steps out of 20-50.
+
+**Quick Fix:**
+```python
+# Instead of default ranges, use wide ranges for guaranteed effect
+injector.add_injection(
+    block="middle:0", 
+    prompt="your injection", 
+    weight=3.0,
+    sigma_start=15.0,    # Start early
+    sigma_end=0.0        # End late  
+)
+```
+
+**Debug Steps:**
+1. **Use extreme weights** (5.0-10.0) to test if injection works at all
+2. **Use wide sigma ranges** (15.0 → 0.0) to maximize injection window
+3. **Use more inference steps** (30-50) to give more chances for injection
+4. **Use dramatically different prompts** ("dragon" vs "building") to see clear differences
+
+### **"Injections are too weak"**
+
+- **Increase weight**: Try 2.0-5.0 instead of 1.0
+- **Use multiple blocks**: Inject into several blocks for cumulative effect
+- **Check semantic compatibility**: Conflicting prompts can cancel each other out
+
+### **"Multi-scale injections create chaotic results"**
+
+- **Avoid overlapping sigma ranges**: Different resolution levels should inject at different times
+- **Use compatible prompts**: "stone castle" + "stone textures" works better than "castle" + "abstract art"
+- **Start with single injections**: Test one resolution level at a time
 
 ## License
 
