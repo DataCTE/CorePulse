@@ -21,6 +21,17 @@ Control how much the model focuses on specific words in your prompt by directly 
 
 *Example: In "a photorealistic portrait of an astronaut", boost attention on "photorealistic" to enhance realism without changing the prompt*
 
+### **Multi-Scale Control**
+Apply different prompts to different resolution levels of the UNet architecture. This approach lets you control structure and details independently:
+
+- **Structure Level** (lowest resolution) → Overall composition, global layout, major objects
+- **Mid-Level** (medium resolution) → Regional features, object relationships, local composition  
+- **Detail Level** (highest resolution) → Fine textures, surface details, small elements
+
+*Example: Generate a castle's overall silhouette with "gothic cathedral" at structure level, while adding "intricate stone carvings" at detail level*
+
+The key insight: **different resolution levels control different aspects of the final image**. By targeting them separately, you achieve unprecedented control over the generation process.
+
 ## Technical Features
 
 - **Multi-Architecture Support**: SDXL and SD1.5 with automatic detection
@@ -98,13 +109,40 @@ with AttentionMapInjector(pipeline) as injector:
     )
 ```
 
+### Multi-Scale Control: Structure + Details
+```python
+from core_pulse import MultiScaleInjector
+
+# Control structure and details independently
+with MultiScaleInjector(pipeline) as injector:
+    # Structure: What the overall composition should be
+    injector.add_structure_injection(
+        "gothic cathedral silhouette, imposing architecture",
+        weight=2.0
+    )
+    
+    # Details: What the surface textures should look like  
+    injector.add_detail_injection(
+        "weathered stone, intricate carvings, moss-covered surfaces",
+        weight=1.8
+    )
+    
+    # Base prompt provides the scene context
+    result = injector(
+        prompt="a building in a misty landscape",
+        num_inference_steps=30
+    )
+    # Result: Gothic cathedral structure with detailed stone textures
+```
+
 ### When to Use Which Technique
 
 | Technique | Use When | Example |
 |-----------|----------|---------|
 | **Prompt Injection** | You want to replace/add content while keeping context | Generate a cat in a dog scene |
 | **Attention Manipulation** | You want to emphasize existing words more strongly | Make "photorealistic" really count |
-| **Both Together** | Complex control over multiple aspects | Inject "dragon" + amplify "majestic" |
+| **Multi-Scale Control** | You want different structure and details | Castle structure + stone texture details |
+| **Combined Techniques** | Complex control over multiple aspects | Multi-scale + attention manipulation |
 
 ## Installation
 
@@ -121,6 +159,7 @@ CorePulse offers multiple levels of control:
 ### **Interfaces by Complexity**
 - **`SimplePromptInjector`** → One-liner injection for quick experiments  
 - **`AdvancedPromptInjector`** → Multi-block, multi-prompt configurations
+- **`MultiScaleInjector`** → Resolution-aware structure/detail control
 - **`AttentionMapInjector`** → Precise attention weight control
 - **`RegionalPromptInjector`** → Spatial masks for region-specific control
 
@@ -134,6 +173,11 @@ CorePulse offers multiple levels of control:
 
 **Content/Style Split** (`examples.py`):
 - Generate a cat with oil painting style in a photorealistic scene
+
+**Multi-Scale Architecture** (`advanced_control_examples.py`):
+- Structure level: "medieval fortress" → Controls overall building shape
+- Detail level: "weathered stone textures" → Controls surface appearance
+- Independent control of composition vs fine details
 
 **Attention Boost** (`attention_examples.py`): 
 - Amplify "photorealistic" attention for enhanced realism
@@ -175,9 +219,18 @@ injector.add_injection(
 
 ### **"Multi-scale injections create chaotic results"**
 
-- **Avoid overlapping sigma ranges**: Different resolution levels should inject at different times
-- **Use compatible prompts**: "stone castle" + "stone textures" works better than "castle" + "abstract art"
-- **Start with single injections**: Test one resolution level at a time
+**Multi-scale control is powerful but requires thoughtful prompt design:**
+
+- **Use semantically compatible prompts**: 
+  - Good: "gothic cathedral" (structure) + "weathered stone" (details)
+  - Bad: "modern building" (structure) + "organic textures" (details)
+
+- **Avoid overlapping sigma ranges**: Structure and detail injections should target different phases:
+  - Structure: Early phases (sigma 15.0→0.5) for composition
+  - Details: Later phases (sigma 3.0→0.0) for surface textures
+
+- **Start simple**: Test structure-only, then detail-only, then combine
+- **Think hierarchically**: Structure defines the "what", details define the "how it looks"
 
 ## License
 
