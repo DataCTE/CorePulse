@@ -10,7 +10,25 @@ Inject different prompts into specific architectural blocks of the UNet during g
 - **Style blocks** (output layers) → How it looks and feels
 - **Composition blocks** (input layers) → Overall layout and structure
 
-*Example: Generate "a cat" in content blocks while injecting "oil painting style" in style blocks*
+#### **Token-Level Attention Masking**
+Control which parts of your prompt have influence by masking attention to specific tokens/words. This is different from spatial masking - it works at the linguistic level rather than image regions.
+
+- **Selective attention** → Choose which words in your prompt get processed
+- **Token-level control** → Fine-grained control over prompt interpretation
+- **Linguistic precision** → Target specific concepts without changing prompt text
+
+*Example: In "a cat playing at a park", mask attention to "cat" tokens while preserving attention to "playing at a park"*
+
+![Masked Injection Example](media/masked_injection_comparison.png)
+
+#### **Regional/Spatial Injection**
+Apply prompt injections only to specific regions of the image using spatial masks. This enables surgical control over different areas of your image.
+
+- **Targeted replacement** → Change specific image regions while preserving context
+- **Spatial precision** → Control exactly where changes occur  
+- **Context preservation** → Background and surroundings remain untouched
+
+*Example: Apply "golden retriever dog" only to a circular region in the center, keeping the park environment identical*
 
 ### **Attention Manipulation** 
 Control how much the model focuses on specific words in your prompt by directly modifying attention weights. Unlike changing the prompt text, this amplifies or reduces the model's internal focus on existing words.
@@ -21,6 +39,8 @@ Control how much the model focuses on specific words in your prompt by directly 
 - **Spatial control** → Apply attention changes only to specific image regions
 
 *Example: In "a photorealistic portrait of an astronaut", boost attention on "photorealistic" to enhance realism without changing the prompt*
+
+![Attention Manipulation Example](media/attention_manipulation_comparison.png)
 
 ### **Multi-Scale Control**
 Apply different prompts to different resolution levels of the UNet architecture. This approach lets you control structure and details independently:
@@ -33,6 +53,10 @@ Apply different prompts to different resolution levels of the UNet architecture.
 *Example: Generate a castle's overall silhouette with "gothic cathedral" at structure level, while adding "intricate stone carvings" at detail level*
 
 The key insight: **different resolution levels control different aspects of the final image**. By targeting them separately, you achieve unprecedented control over the generation process.
+
+![Multi-Scale Main Comparison](media/multi_scale_main_comparison.png)
+
+![Multi-Scale Semantic Comparison](media/multi_scale_semantic_comparison.png)
 
 ## Technical Features
 
@@ -55,13 +79,13 @@ Prompt injections are applied during specific phases of the diffusion process us
 **⚠️ Critical:** Default sigma ranges may be too narrow! If your injections seem to have no effect, try wider ranges:
 
 ```python
-# ❌ Too narrow - might only inject on 1-2 steps
+#  Too narrow - might only inject on 1-2 steps
 injector.add_injection("middle:0", "dragon", sigma_start=1.0, sigma_end=0.3)
 
-# ✅ Better - injects across most steps  
+#  Better - injects across most steps  
 injector.add_injection("middle:0", "dragon", sigma_start=15.0, sigma_end=0.0)
 
-# ✅ Always inject - bypass timing completely
+#  Always inject - bypass timing completely
 injector.add_injection("middle:0", "dragon", sigma_start=1000.0, sigma_end=-1000.0)
 ```
 
@@ -87,6 +111,41 @@ with SimplePromptInjector(pipeline) as injector:
     # Base prompt provides context, injection overrides content
     result = injector("a blue dog in a garden", num_inference_steps=30)
     # Result: A white cat in a garden (content replaced, context preserved)
+```
+
+### Regional/Spatial Injection: Surgical Precision
+```python
+from core_pulse import RegionalPromptInjector
+from core_pulse.prompt_injection.spatial import create_center_circle_mask
+
+# Create a spatial mask for the region you want to modify
+mask = create_center_circle_mask(image_size=(1024, 1024), radius=300)
+
+with RegionalPromptInjector(pipeline) as injector:
+    injector.add_regional_injection(
+        block="middle:0",
+        prompt="golden retriever dog",  # Replace with this
+        mask=mask,                      # Only in this region
+        weight=2.5,
+        sigma_start=15.0,
+        sigma_end=0.0
+    )
+    
+    # The mask ensures only the center region changes
+    result = injector("a cat playing at a park", num_inference_steps=30)
+    # Result: Dog in center, park environment perfectly preserved
+```
+
+**Available Mask Shapes:**
+```python
+from core_pulse.prompt_injection.spatial import (
+    create_rectangle_mask,     # Custom rectangular regions
+    create_circle_mask,        # Circular regions  
+    create_left_half_mask,     # Left/right halves
+    create_top_half_mask,      # Top/bottom halves
+    create_center_square_mask, # Centered shapes
+    MaskFactory.from_image     # Load custom masks from images
+)
 ```
 
 ### Attention Manipulation: Focus Control
@@ -142,9 +201,11 @@ with MultiScaleInjector(pipeline) as injector:
 | Technique | Use When | Example |
 |-----------|----------|---------|
 | **Prompt Injection** | You want to replace/add content while keeping context | Generate a cat in a dog scene |
+| **Token-Level Attention Masking** | You want to selectively ignore/emphasize parts of your prompt | Mask out "cat" tokens, keep "playing at park" |
+| **Regional/Spatial Injection** | You want surgical precision - change specific image regions only | Replace center region with dog, keep park untouched |
 | **Attention Manipulation** | You want to emphasize existing words more strongly | Make "photorealistic" really count |
 | **Multi-Scale Control** | You want different structure and details | Castle structure + stone texture details |
-| **Combined Techniques** | Complex control over multiple aspects | Multi-scale + attention manipulation |
+| **Combined Techniques** | Complex control over multiple aspects | Regional masking + multi-scale control |
 
 ## Installation
 
@@ -175,6 +236,16 @@ CorePulse offers multiple levels of control:
 
 **Content/Style Split** (`examples.py`):
 - Generate a cat with oil painting style in a photorealistic scene
+
+**Token-Level Attention Masking** (`attention_masking_examples.py`):
+- Selective prompt token control: mask "cat" tokens while preserving "park" context
+- Linguistic precision: control what parts of prompt get processed
+- Demonstrates token-level vs full prompt processing
+
+**Regional/Spatial Injection** (`spatial_injection_examples.py`):
+- Surgical region replacement: change center region while preserving surroundings
+- Spatial masking: modify specific image areas while keeping context intact
+- Demonstrates spatial precision control vs full scene modification
 
 **Multi-Scale Architecture** (`advanced_control_examples.py`):
 - Structure level: "medieval fortress" → Controls overall building shape
