@@ -14,6 +14,7 @@ Inject different prompts into specific architectural blocks of the UNet during g
 
 ### **Attention Manipulation** 
 Control how much the model focuses on specific words in your prompt by directly modifying attention weights. Unlike changing the prompt text, this amplifies or reduces the model's internal focus on existing words.
+> note as of now this has only been tested with SDXL
 
 - **Amplify attention** (>1.0) → Make the model pay more attention to specific words
 - **Reduce attention** (<1.0) → Decrease focus on certain words  
@@ -23,6 +24,7 @@ Control how much the model focuses on specific words in your prompt by directly 
 
 ### **Multi-Scale Control**
 Apply different prompts to different resolution levels of the UNet architecture. This approach lets you control structure and details independently:
+> note as of now this has only been tested with SDXL
 
 - **Structure Level** (lowest resolution) → Overall composition, global layout, major objects
 - **Mid-Level** (medium resolution) → Regional features, object relationships, local composition  
