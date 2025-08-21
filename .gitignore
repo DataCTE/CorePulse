@@ -2,3 +2,4 @@
 __pycache__/
 .cursor/
 .pytest_cache/
+uv.lock
