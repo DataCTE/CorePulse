@@ -28,6 +28,7 @@ from .attention import AttentionMapInjector
 from .self_attention import SelfAttentionInjector
 from .multi_scale import MultiScaleInjector
 from .unified import UnifiedAdvancedInjector
+from .llm_attention import LLMAttentionInjector, create_concept_amplified_model, create_balanced_attention_model
 
 __all__ = [
     "BasePromptInjector",
@@ -42,6 +43,10 @@ __all__ = [
     "SelfAttentionInjector",
     "MultiScaleInjector",
     "UnifiedAdvancedInjector",
+    # LLM attention manipulation
+    "LLMAttentionInjector",
+    "create_concept_amplified_model",
+    "create_balanced_attention_model",
     "RegionalComposition",
     "CompositionLayer",
     "BlendMode",
